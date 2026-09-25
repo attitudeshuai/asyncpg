@@ -108,11 +108,14 @@ cdef class PreparedStatementState:
                 "named prepared statements cannot be marked unprepared")
         self.prepared = False
 
-    cdef _encode_bind_msg(self, args, int seqno = -1):
+    cdef _encode_bind_msg(self, args, int seqno = -1, object limits = None):
         cdef:
             int idx
             WriteBuffer writer
             Codec codec
+            ssize_t arg_start
+            ssize_t arg_len
+            int64_t param_limit
 
         if not cpython.PySequence_Check(args):
             if seqno >= 0:
@@ -171,10 +174,46 @@ cdef class PreparedStatementState:
                 writer.write_int32(-1)
             else:
                 codec = <Codec>(self.args_codecs[idx])
+                if limits is not None and \
+                        limits.parameter_max_length is not None:
+                    param_limit = limits.parameter_max_length
+                else:
+                    param_limit = -1
                 try:
+                    if param_limit >= 0:
+                        arg_start = writer.len()
                     codec.encode(self.settings, writer, arg)
+                    if param_limit >= 0:
+                        # Every parameter is serialized as an int32
+                        # length prefix followed by the datum bytes;
+                        # the parameter size is the datum itself.
+                        arg_len = writer.len() - arg_start - 4
+                        if arg_len > <ssize_t>param_limit:
+                            if seqno >= 0:
+                                raise exceptions.ParameterSizeLimitError(
+                                    f'query argument ${idx + 1} in element '
+                                    f'#{seqno} of executemany() sequence: '
+                                    f'encoded parameter size ({arg_len} '
+                                    f'bytes) exceeds the configured '
+                                    f'parameter_max_length limit '
+                                    f'({param_limit} bytes)',
+                                    size=arg_len,
+                                    limit=<ssize_t>param_limit)
+                            else:
+                                raise exceptions.ParameterSizeLimitError(
+                                    f'query argument ${idx + 1}: encoded '
+                                    f'parameter size ({arg_len} bytes) '
+                                    f'exceeds the configured '
+                                    f'parameter_max_length limit '
+                                    f'({param_limit} bytes)',
+                                    size=arg_len,
+                                    limit=<ssize_t>param_limit)
                 except (AssertionError, exceptions.InternalClientError):
                     # These are internal errors and should raise as-is.
+                    raise
+                except exceptions.SizeLimitError:
+                    # Already a specific size-limit violation; do not
+                    # annotate or wrap it.
                     raise
                 except exceptions.InterfaceError as e:
                     # This is already a descriptive error, but annotate

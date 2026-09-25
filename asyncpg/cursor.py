@@ -25,6 +25,7 @@ class CursorFactory(connresource.ConnectionResource):
         '_query',
         '_timeout',
         '_record_class',
+        '_size_limits',
     )
 
     def __init__(
@@ -35,7 +36,8 @@ class CursorFactory(connresource.ConnectionResource):
         args,
         prefetch,
         timeout,
-        record_class
+        record_class,
+        size_limits=None
     ):
         super().__init__(connection)
         self._args = args
@@ -44,6 +46,7 @@ class CursorFactory(connresource.ConnectionResource):
         self._timeout = timeout
         self._state = state
         self._record_class = record_class
+        self._size_limits = size_limits
         if state is not None:
             state.attach()
 
@@ -58,6 +61,7 @@ class CursorFactory(connresource.ConnectionResource):
             self._record_class,
             prefetch,
             self._timeout,
+            self._size_limits,
         )
 
     @connresource.guarded
@@ -71,6 +75,7 @@ class CursorFactory(connresource.ConnectionResource):
             self._state,
             self._args,
             self._record_class,
+            self._size_limits,
         )
         return cursor._init(self._timeout).__await__()
 
@@ -89,9 +94,11 @@ class BaseCursor(connresource.ConnectionResource):
         '_exhausted',
         '_query',
         '_record_class',
+        '_size_limits',
     )
 
-    def __init__(self, connection, query, state, args, record_class):
+    def __init__(self, connection, query, state, args, record_class,
+                 size_limits=None):
         super().__init__(connection)
         self._args = args
         self._state = state
@@ -101,6 +108,7 @@ class BaseCursor(connresource.ConnectionResource):
         self._exhausted = False
         self._query = query
         self._record_class = record_class
+        self._size_limits = size_limits
 
     def _check_ready(self):
         if self._state is None:
@@ -115,7 +123,7 @@ class BaseCursor(connresource.ConnectionResource):
             raise exceptions.NoActiveSQLTransactionError(
                 'cursor cannot be created outside of a transaction')
 
-    async def _bind_exec(self, n, timeout):
+    async def _bind_exec(self, n, timeout, size_limits=None):
         self._check_ready()
 
         if self._portal_name:
@@ -125,12 +133,15 @@ class BaseCursor(connresource.ConnectionResource):
         con = self._connection
         protocol = con._protocol
 
+        if size_limits is None:
+            size_limits = self._size_limits
         self._portal_name = con._get_unique_id('portal')
         buffer, _, self._exhausted = await protocol.bind_execute(
-            self._state, self._args, self._portal_name, n, True, timeout)
+            self._state, self._args, self._portal_name, n, True, timeout,
+            size_limits)
         return buffer
 
-    async def _bind(self, timeout):
+    async def _bind(self, timeout, size_limits=None):
         self._check_ready()
 
         if self._portal_name:
@@ -140,22 +151,27 @@ class BaseCursor(connresource.ConnectionResource):
         con = self._connection
         protocol = con._protocol
 
+        if size_limits is None:
+            size_limits = self._size_limits
         self._portal_name = con._get_unique_id('portal')
         buffer = await protocol.bind(self._state, self._args,
                                      self._portal_name,
-                                     timeout)
+                                     timeout, size_limits)
         return buffer
 
-    async def _exec(self, n, timeout):
+    async def _exec(self, n, timeout, size_limits=None):
         self._check_ready()
 
         if not self._portal_name:
             raise exceptions.InterfaceError(
                 'cursor does not have an open portal')
 
+        if size_limits is None:
+            size_limits = self._size_limits
         protocol = self._connection._protocol
         buffer, _, self._exhausted = await protocol.execute(
-            self._state, self._portal_name, n, True, timeout)
+            self._state, self._portal_name, n, True, timeout,
+            size_limits=size_limits)
         return buffer
 
     async def _close_portal(self, timeout):
@@ -203,9 +219,11 @@ class CursorIterator(BaseCursor):
         args,
         record_class,
         prefetch,
-        timeout
+        timeout,
+        size_limits=None
     ):
-        super().__init__(connection, query, state, args, record_class)
+        super().__init__(connection, query, state, args, record_class,
+                         size_limits)
 
         if prefetch <= 0:
             raise exceptions.InterfaceError(
@@ -227,15 +245,18 @@ class CursorIterator(BaseCursor):
                 self._timeout,
                 named=True,
                 record_class=self._record_class,
+                size_limits=self._size_limits,
             )
             self._state.attach()
 
         if not self._portal_name and not self._exhausted:
-            buffer = await self._bind_exec(self._prefetch, self._timeout)
+            buffer = await self._bind_exec(
+                self._prefetch, self._timeout)
             self._buffer.extend(buffer)
 
         if not self._buffer and not self._exhausted:
-            buffer = await self._exec(self._prefetch, self._timeout)
+            buffer = await self._exec(
+                self._prefetch, self._timeout)
             self._buffer.extend(buffer)
 
         if self._portal_name and self._exhausted:
@@ -259,6 +280,7 @@ class Cursor(BaseCursor):
                 timeout,
                 named=True,
                 record_class=self._record_class,
+                size_limits=self._size_limits,
             )
             self._state.attach()
         self._check_ready()
@@ -266,10 +288,12 @@ class Cursor(BaseCursor):
         return self
 
     @connresource.guarded
-    async def fetch(self, n, *, timeout=None):
+    async def fetch(self, n, *, timeout=None, size_limits=None):
         r"""Return the next *n* rows as a list of :class:`Record` objects.
 
         :param float timeout: Optional timeout value in seconds.
+        :param size_limits: Optional per-call override of the client-side
+            size limits.
 
         :return: A list of :class:`Record` instances.
         """
@@ -278,23 +302,25 @@ class Cursor(BaseCursor):
             raise exceptions.InterfaceError('n must be greater than zero')
         if self._exhausted:
             return []
-        recs = await self._exec(n, timeout)
+        recs = await self._exec(n, timeout, size_limits)
         if len(recs) < n:
             self._exhausted = True
         return recs
 
     @connresource.guarded
-    async def fetchrow(self, *, timeout=None):
+    async def fetchrow(self, *, timeout=None, size_limits=None):
         r"""Return the next row.
 
         :param float timeout: Optional timeout value in seconds.
+        :param size_limits: Optional per-call override of the client-side
+            size limits.
 
         :return: A :class:`Record` instance.
         """
         self._check_ready()
         if self._exhausted:
             return None
-        recs = await self._exec(1, timeout)
+        recs = await self._exec(1, timeout, size_limits)
         if len(recs) < 1:
             self._exhausted = True
             return None

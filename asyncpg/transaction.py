@@ -9,6 +9,12 @@ import enum
 
 from . import connresource
 from . import exceptions as apg_errors
+from .size_limits import SizeLimits
+
+
+#: Transaction control statements are issued by asyncpg itself, so the
+#: user-configured size limits do not apply to them.
+_NO_LIMITS = SizeLimits()
 
 
 class TransactionState(enum.Enum):
@@ -143,7 +149,8 @@ class Transaction(connresource.ConnectionResource):
             query += ';'
 
         try:
-            await self._connection.execute(query)
+            await self._connection.execute(
+                query, size_limits=_NO_LIMITS)
         except BaseException:
             self._state = TransactionState.FAILED
             raise
@@ -184,7 +191,8 @@ class Transaction(connresource.ConnectionResource):
             query = 'COMMIT;'
 
         try:
-            await self._connection.execute(query)
+            await self._connection.execute(
+                query, size_limits=_NO_LIMITS)
         except BaseException:
             self._state = TransactionState.FAILED
             raise
@@ -203,7 +211,8 @@ class Transaction(connresource.ConnectionResource):
             query = 'ROLLBACK;'
 
         try:
-            await self._connection.execute(query)
+            await self._connection.execute(
+                query, size_limits=_NO_LIMITS)
         except BaseException:
             self._state = TransactionState.FAILED
             raise

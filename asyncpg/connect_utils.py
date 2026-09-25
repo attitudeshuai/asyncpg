@@ -31,6 +31,7 @@ import inspect
 from . import compat
 from . import exceptions
 from . import protocol
+from .size_limits import SizeLimits
 
 
 class SSLMode(enum.IntEnum):
@@ -76,6 +77,7 @@ _ClientConfiguration = collections.namedtuple(
         'statement_cache_size',
         'max_cached_statement_lifetime',
         'max_cacheable_statement_size',
+        'size_limits',
     ])
 
 
@@ -864,6 +866,10 @@ def _parse_connect_arguments(*, dsn, host, port, user, password, passfile,
                              statement_cache_size,
                              max_cached_statement_lifetime,
                              max_cacheable_statement_size,
+                             query_max_length,
+                             parameter_max_length,
+                             row_max_length,
+                             message_max_length,
                              ssl, direct_tls, server_settings,
                              target_session_attrs, krbsrvname, gsslib,
                              service, servicefile):
@@ -890,6 +896,15 @@ def _parse_connect_arguments(*, dsn, host, port, user, password, passfile,
                 'expected greater than 0 float (got {!r})'.format(
                     command_timeout)) from None
 
+    # SizeLimits() validates the values (type, negative and out-of-range)
+    # immediately so that misconfiguration fails before connecting.
+    size_limits = SizeLimits(
+        query_max_length=query_max_length,
+        parameter_max_length=parameter_max_length,
+        row_max_length=row_max_length,
+        message_max_length=message_max_length,
+    )
+
     addrs, params = _parse_connect_dsn_and_args(
         dsn=dsn, host=host, port=port, user=user,
         password=password, passfile=passfile, ssl=ssl,
@@ -903,7 +918,8 @@ def _parse_connect_arguments(*, dsn, host, port, user, password, passfile,
         command_timeout=command_timeout,
         statement_cache_size=statement_cache_size,
         max_cached_statement_lifetime=max_cached_statement_lifetime,
-        max_cacheable_statement_size=max_cacheable_statement_size,)
+        max_cacheable_statement_size=max_cacheable_statement_size,
+        size_limits=size_limits,)
 
     return addrs, params, config
 

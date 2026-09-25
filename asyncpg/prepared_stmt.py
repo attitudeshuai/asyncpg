@@ -102,13 +102,15 @@ class PreparedStatement(connresource.ConnectionResource):
 
     @connresource.guarded
     def cursor(self, *args, prefetch=None,
-               timeout=None) -> cursor.CursorFactory:
+               timeout=None, size_limits=None) -> cursor.CursorFactory:
         """Return a *cursor factory* for the prepared statement.
 
         :param args: Query arguments.
         :param int prefetch: The number of rows the *cursor iterator*
                              will prefetch (defaults to ``50``.)
         :param float timeout: Optional timeout in seconds.
+        :param size_limits: Optional per-call override of the client-side
+                            size limits.
 
         :return: A :class:`~cursor.CursorFactory` object.
         """
@@ -120,10 +122,11 @@ class PreparedStatement(connresource.ConnectionResource):
             prefetch,
             timeout,
             self._state.record_class,
+            size_limits,
         )
 
     @connresource.guarded
-    async def explain(self, *args, analyze=False):
+    async def explain(self, *args, analyze=False, size_limits=None):
         """Return the execution plan of the statement.
 
         :param args: Query arguments.
@@ -156,16 +159,18 @@ class PreparedStatement(connresource.ConnectionResource):
             tr = self._connection.transaction()
             await tr.start()
             try:
-                data = await self._connection.fetchval(query, *args)
+                data = await self._connection.fetchval(
+                    query, *args, size_limits=size_limits)
             finally:
                 await tr.rollback()
         else:
-            data = await self._connection.fetchval(query, *args)
+            data = await self._connection.fetchval(
+                query, *args, size_limits=size_limits)
 
         return json.loads(data)
 
     @connresource.guarded
-    async def fetch(self, *args, timeout=None):
+    async def fetch(self, *args, timeout=None, size_limits=None):
         r"""Execute the statement and return a list of :class:`Record` objects.
 
         :param str query: Query text
@@ -174,11 +179,12 @@ class PreparedStatement(connresource.ConnectionResource):
 
         :return: A list of :class:`Record` instances.
         """
-        data = await self.__bind_execute(args, 0, timeout)
+        data = await self.__bind_execute(args, 0, timeout, size_limits)
         return data
 
     @connresource.guarded
-    async def fetchval(self, *args, column=0, timeout=None):
+    async def fetchval(self, *args, column=0, timeout=None,
+                       size_limits=None):
         """Execute the statement and return a value in the first row.
 
         :param args: Query arguments.
@@ -191,13 +197,13 @@ class PreparedStatement(connresource.ConnectionResource):
 
         :return: The value of the specified column of the first record.
         """
-        data = await self.__bind_execute(args, 1, timeout)
+        data = await self.__bind_execute(args, 1, timeout, size_limits)
         if not data:
             return None
         return data[0][column]
 
     @connresource.guarded
-    async def fetchrow(self, *args, timeout=None):
+    async def fetchrow(self, *args, timeout=None, size_limits=None):
         """Execute the statement and return the first row.
 
         :param str query: Query text
@@ -206,13 +212,13 @@ class PreparedStatement(connresource.ConnectionResource):
 
         :return: The first row as a :class:`Record` instance.
         """
-        data = await self.__bind_execute(args, 1, timeout)
+        data = await self.__bind_execute(args, 1, timeout, size_limits)
         if not data:
             return None
         return data[0]
 
     @connresource.guarded
-    async def fetchmany(self, args, *, timeout=None):
+    async def fetchmany(self, args, *, timeout=None, size_limits=None):
         """Execute the statement and return a list of :class:`Record` objects.
 
         :param args: Query arguments.
@@ -229,11 +235,14 @@ class PreparedStatement(connresource.ConnectionResource):
                 portal_name='',
                 timeout=timeout,
                 return_rows=True,
+                size_limits=size_limits,
             )
         )
 
     @connresource.guarded
-    async def executemany(self, args, *, timeout: typing.Optional[float]=None):
+    async def executemany(self, args, *,
+                          timeout: typing.Optional[float]=None,
+                          size_limits=None):
         """Execute the statement for each sequence of arguments in *args*.
 
         :param args: An iterable containing sequences of arguments.
@@ -249,6 +258,7 @@ class PreparedStatement(connresource.ConnectionResource):
                 portal_name='',
                 timeout=timeout,
                 return_rows=False,
+                size_limits=size_limits,
             ))
 
     async def __do_execute(self, executor):
@@ -264,10 +274,10 @@ class PreparedStatement(connresource.ConnectionResource):
             self._state.mark_closed()
             raise
 
-    async def __bind_execute(self, args, limit, timeout):
+    async def __bind_execute(self, args, limit, timeout, size_limits=None):
         data, status, _ = await self.__do_execute(
             lambda protocol: protocol.bind_execute(
-                self._state, args, '', limit, True, timeout))
+                self._state, args, '', limit, True, timeout, size_limits))
         self._last_status = status
         return data
 

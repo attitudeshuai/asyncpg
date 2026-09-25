@@ -10,6 +10,7 @@ from .connection import connect, Connection  # NOQA
 from .exceptions import *  # NOQA
 from .pool import create_pool, Pool  # NOQA
 from .protocol import Record  # NOQA
+from .size_limits import SizeLimits, MAX_SIZE_LIMIT  # NOQA
 from .types import *  # NOQA
 
 
@@ -19,6 +20,7 @@ from . import exceptions
 
 
 __all__: tuple[str, ...] = (
-    'connect', 'create_pool', 'Pool', 'Record', 'Connection'
+    'connect', 'create_pool', 'Pool', 'Record', 'Connection',
+    'SizeLimits', 'MAX_SIZE_LIMIT',
 )
 __all__ += exceptions.__all__ # NOQA

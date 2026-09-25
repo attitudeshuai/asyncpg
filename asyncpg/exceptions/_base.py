@@ -14,6 +14,9 @@ __all__ = ('PostgresError', 'FatalPostgresError', 'UnknownPostgresError',
            'InterfaceError', 'InterfaceWarning', 'PostgresLogMessage',
            'ClientConfigurationError',
            'InternalClientError', 'OutdatedSchemaCacheError', 'ProtocolError',
+           'SizeLimitError', 'QueryTextSizeLimitError',
+           'ParameterSizeLimitError', 'ResultRowSizeLimitError',
+           'MessageSizeLimitError',
            'UnsupportedClientFeatureError', 'TargetServerAttributeNotMatched',
            'UnsupportedServerFeatureError')
 
@@ -228,6 +231,34 @@ class ClientConfigurationError(InterfaceError, ValueError):
 
 class DataError(InterfaceError, ValueError):
     """An error caused by invalid query input."""
+
+
+class SizeLimitError(InterfaceError):
+    """A query, its parameters, its result or a protocol message
+    exceeded the size limit configured on the client."""
+
+    def __init__(self, msg, *, size, limit, detail=None, hint=None):
+        super().__init__(msg, detail=detail, hint=hint)
+        #: The actual size, in bytes, that violated the limit.
+        self.size = size
+        #: The configured limit, in bytes.
+        self.limit = limit
+
+
+class QueryTextSizeLimitError(SizeLimitError):
+    """An encoded query text exceeded ``query_max_length``."""
+
+
+class ParameterSizeLimitError(SizeLimitError):
+    """An encoded query parameter exceeded ``parameter_max_length``."""
+
+
+class ResultRowSizeLimitError(SizeLimitError):
+    """A result row exceeded ``row_max_length``."""
+
+
+class MessageSizeLimitError(SizeLimitError):
+    """A protocol message exceeded ``message_max_length``."""
 
 
 class UnsupportedClientFeatureError(InterfaceError):

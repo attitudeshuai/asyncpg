@@ -140,7 +140,8 @@ cdef class BaseProtocol(CoreProtocol):
                       *,
                       PreparedStatementState state=None,
                       ignore_custom_codec=False,
-                      record_class):
+                      record_class,
+                      size_limits=None):
         if self.cancel_waiter is not None:
             await self.cancel_waiter
         if self.cancel_sent_waiter is not None:
@@ -149,10 +150,21 @@ cdef class BaseProtocol(CoreProtocol):
 
         self._check_state()
         timeout = self._get_timeout_impl(timeout)
+        # Fail before anything is sent so that the server never receives
+        # an (oversized) partial request and the connection stays usable.
+        self._check_query_size_limit(query, size_limits)
+        if (size_limits is not None and
+                size_limits.message_max_length is not None):
+            # Builds and validates the Parse message; raises before the
+            # waiter/network section below if it is too large.
+            self._build_parse_message(
+                stmt_name, query, size_limits)
+        self.size_limits = size_limits
 
         waiter = self._new_waiter(timeout)
         try:
-            self._prepare_and_describe(stmt_name, query)  # network op
+            self._prepare_and_describe(
+                stmt_name, query, size_limits)  # network op
             self.last_query = query
             if state is None:
                 state = PreparedStatementState(
@@ -172,6 +184,7 @@ cdef class BaseProtocol(CoreProtocol):
         limit: int,
         return_extra: bool,
         timeout,
+        size_limits=None,
     ):
         if self.cancel_waiter is not None:
             await self.cancel_waiter
@@ -181,18 +194,36 @@ cdef class BaseProtocol(CoreProtocol):
 
         self._check_state()
         timeout = self._get_timeout_impl(timeout)
-        args_buf = state._encode_bind_msg(args)
+        cdef WriteBuffer bind_preview
+        # Both the query text and the encoded parameters are validated
+        # before any byte is written, so an oversize request cannot
+        # leave a partial protocol message on the wire.
+        self._check_query_size_limit(state.query, size_limits)
+        args_buf = state._encode_bind_msg(args, -1, size_limits)
+        self.size_limits = size_limits
+        # Validate the assembled Bind message (and the Parse message
+        # when the statement is not prepared yet) before anything is
+        # written, so an oversize request fails the call atomically.
+        if (size_limits is not None and
+                size_limits.message_max_length is not None):
+            bind_preview = self._build_bind_message(
+                portal_name, state.name, args_buf, size_limits)
+            if not state.prepared:
+                self._build_parse_message(
+                    state.name, state.query, size_limits)
 
         waiter = self._new_waiter(timeout)
         try:
             if not state.prepared:
-                self._send_parse_message(state.name, state.query)
+                self._send_parse_message(
+                    state.name, state.query, size_limits)
 
             self._bind_execute(
                 portal_name,
                 state.name,
                 args_buf,
-                limit)  # network op
+                limit,
+                size_limits)  # network op
 
             self.last_query = state.query
             self.statement = state
@@ -211,6 +242,7 @@ cdef class BaseProtocol(CoreProtocol):
         portal_name: str,
         timeout,
         return_rows: bool,
+        size_limits=None,
     ):
         if self.cancel_waiter is not None:
             await self.cancel_waiter
@@ -220,24 +252,42 @@ cdef class BaseProtocol(CoreProtocol):
 
         self._check_state()
         timeout = self._get_timeout_impl(timeout)
+        # Validate the query text before the parse message is sent;
+        # individual arguments are checked lazily as they are encoded.
+        self._check_query_size_limit(state.query, size_limits)
+        self.size_limits = size_limits
         timer = Timer(timeout)
 
         # Make sure the argument sequence is encoded lazily with
         # this generator expression to keep the memory pressure under
         # control.
-        data_gen = (state._encode_bind_msg(b, i) for i, b in enumerate(args))
+        data_gen = (
+            state._encode_bind_msg(b, i, size_limits)
+            for i, b in enumerate(args)
+        )
         arg_bufs = iter(data_gen)
+
+        # Validate the Parse message before anything is written; bind
+        # messages for individual elements are checked lazily while
+        # streaming, with the executemany atomicity rules applied.
+        if (size_limits is not None and
+                size_limits.message_max_length is not None and
+                not state.prepared):
+            self._build_parse_message(
+                state.name, state.query, size_limits)
 
         waiter = self._new_waiter(timeout)
         try:
             if not state.prepared:
-                self._send_parse_message(state.name, state.query)
+                self._send_parse_message(
+                    state.name, state.query, size_limits)
 
             more = self._bind_execute_many(
                 portal_name,
                 state.name,
                 arg_bufs,
-                return_rows)  # network op
+                return_rows,
+                size_limits)  # network op
 
             self.last_query = state.query
             self.statement = state
@@ -266,7 +316,7 @@ cdef class BaseProtocol(CoreProtocol):
             return await waiter
 
     async def bind(self, PreparedStatementState state, args,
-                   str portal_name, timeout):
+                   str portal_name, timeout, size_limits=None):
 
         if self.cancel_waiter is not None:
             await self.cancel_waiter
@@ -276,17 +326,29 @@ cdef class BaseProtocol(CoreProtocol):
 
         self._check_state()
         timeout = self._get_timeout_impl(timeout)
-        args_buf = state._encode_bind_msg(args)
+        cdef WriteBuffer bind_preview
+        self._check_query_size_limit(state.query, size_limits)
+        args_buf = state._encode_bind_msg(args, -1, size_limits)
+        self.size_limits = size_limits
+        if (size_limits is not None and
+                size_limits.message_max_length is not None):
+            bind_preview = self._build_bind_message(
+                portal_name, state.name, args_buf, size_limits)
+            if not state.prepared:
+                self._build_parse_message(
+                    state.name, state.query, size_limits)
 
         waiter = self._new_waiter(timeout)
         try:
             if not state.prepared:
-                self._send_parse_message(state.name, state.query)
+                self._send_parse_message(
+                    state.name, state.query, size_limits)
 
             self._bind(
                 portal_name,
                 state.name,
-                args_buf)  # network op
+                args_buf,
+                size_limits)  # network op
 
             self.last_query = state.query
             self.statement = state
@@ -298,7 +360,7 @@ cdef class BaseProtocol(CoreProtocol):
 
     async def execute(self, PreparedStatementState state,
                       str portal_name, int limit, return_extra,
-                      timeout):
+                      timeout, size_limits=None):
 
         if self.cancel_waiter is not None:
             await self.cancel_waiter
@@ -308,6 +370,9 @@ cdef class BaseProtocol(CoreProtocol):
 
         self._check_state()
         timeout = self._get_timeout_impl(timeout)
+        # execute() fetches rows from an already-bound portal; refresh
+        # the effective limits so that result-side checks apply.
+        self.size_limits = size_limits
 
         waiter = self._new_waiter(timeout)
         try:
@@ -347,7 +412,7 @@ cdef class BaseProtocol(CoreProtocol):
         finally:
             return await waiter
 
-    async def query(self, query, timeout):
+    async def query(self, query, timeout, size_limits=None):
         if self.cancel_waiter is not None:
             await self.cancel_waiter
         if self.cancel_sent_waiter is not None:
@@ -359,10 +424,13 @@ cdef class BaseProtocol(CoreProtocol):
         # for consistent validation, as it is called differently from
         # prepare/bind/execute methods.
         timeout = self._get_timeout(timeout)
+        self._check_query_size_limit(query, size_limits)
+        self._check_query_message_size(query, size_limits)
+        self.size_limits = size_limits
 
         waiter = self._new_waiter(timeout)
         try:
-            self._simple_query(query)  # network op
+            self._simple_query(query, size_limits)  # network op
             self.last_query = query
             self.queries_count += 1
         except Exception as ex:
@@ -371,7 +439,7 @@ cdef class BaseProtocol(CoreProtocol):
         finally:
             return await waiter
 
-    async def copy_out(self, copy_stmt, sink, timeout):
+    async def copy_out(self, copy_stmt, sink, timeout, size_limits=None):
         if self.cancel_waiter is not None:
             await self.cancel_waiter
         if self.cancel_sent_waiter is not None:
@@ -381,13 +449,15 @@ cdef class BaseProtocol(CoreProtocol):
         self._check_state()
 
         timeout = self._get_timeout_impl(timeout)
+        self._check_query_size_limit(copy_stmt, size_limits)
+        self._check_query_message_size(copy_stmt, size_limits)
+        self.size_limits = size_limits
         timer = Timer(timeout)
 
         # The copy operation is guarded by a single timeout
         # on the top level.
         waiter = self._new_waiter(timer.get_remaining_budget())
-
-        self._copy_out(copy_stmt)
+        self._copy_out(copy_stmt, size_limits)
 
         try:
             while True:
@@ -425,7 +495,8 @@ cdef class BaseProtocol(CoreProtocol):
         return status_msg
 
     async def copy_in(self, copy_stmt, reader, data,
-                      records, PreparedStatementState record_stmt, timeout):
+                      records, PreparedStatementState record_stmt, timeout,
+                      size_limits=None):
         cdef:
             WriteBuffer wbuf
             ssize_t num_cols
@@ -440,12 +511,15 @@ cdef class BaseProtocol(CoreProtocol):
         self._check_state()
 
         timeout = self._get_timeout_impl(timeout)
+        self._check_query_size_limit(copy_stmt, size_limits)
+        self._check_query_message_size(copy_stmt, size_limits)
+        self.size_limits = size_limits
         timer = Timer(timeout)
 
         waiter = self._new_waiter(timer.get_remaining_budget())
 
         # Initiate COPY IN.
-        self._copy_in(copy_stmt)
+        self._copy_in(copy_stmt, size_limits)
 
         try:
             if record_stmt is not None:
@@ -487,7 +561,7 @@ cdef class BaseProtocol(CoreProtocol):
                         if wbuf.len() >= _COPY_BUFFER_SIZE:
                             with timer:
                                 await self.writing_allowed.wait()
-                            self._write_copy_data_msg(wbuf)
+                            self._write_copy_data_msg(wbuf, size_limits)
                             wbuf = WriteBuffer.new()
                 else:
                     for row in records:
@@ -506,12 +580,12 @@ cdef class BaseProtocol(CoreProtocol):
                         if wbuf.len() >= _COPY_BUFFER_SIZE:
                             with timer:
                                 await self.writing_allowed.wait()
-                            self._write_copy_data_msg(wbuf)
+                            self._write_copy_data_msg(wbuf, size_limits)
                             wbuf = WriteBuffer.new()
 
                 # End of binary copy.
                 wbuf.write_int16(-1)
-                self._write_copy_data_msg(wbuf)
+                self._write_copy_data_msg(wbuf, size_limits)
 
             elif reader is not None:
                 try:
@@ -531,13 +605,13 @@ cdef class BaseProtocol(CoreProtocol):
                             chunk = await compat.wait_for(
                                 iterator.__anext__(),
                                 timeout=timer.get_remaining_budget())
-                        self._write_copy_data_msg(chunk)
+                        self._write_copy_data_msg(chunk, size_limits)
                 except builtins.StopAsyncIteration:
                     pass
             else:
                 # Buffer passed in directly.
                 await self.writing_allowed.wait()
-                self._write_copy_data_msg(data)
+                self._write_copy_data_msg(data, size_limits)
 
         except asyncio.TimeoutError:
             self._write_copy_fail_msg('TimeoutError')
@@ -966,6 +1040,22 @@ cdef class BaseProtocol(CoreProtocol):
     def data_received(self, data):
         self.buffer.feed_data(data)
         self._read_server_messages()
+        if not self.closing:
+            oversized = self._get_pending_oversized_error()
+            if oversized is not None:
+                # The header of the next message declares a size above
+                # the configured limit while its body is still in
+                # flight.  Discarding the body would mean buffering
+                # exactly what the limit is meant to prevent, so the
+                # only deterministic option is to terminate the
+                # connection; the running query fails with the client
+                # exception below.
+                self.result_type = RESULT_FAILED
+                self.result = oversized
+                if (self.waiter is not None and
+                        not self.waiter.done()):
+                    self.waiter.set_exception(oversized)
+                self.abort()
 
     def connection_made(self, transport):
         self.transport = transport

@@ -21,6 +21,7 @@ import asyncpg.pgproto.pgproto
 
 from ..connect_utils import _ConnectionParameters
 from ..pgproto.pgproto import WriteBuffer
+from ..size_limits import SizeLimits
 from ..types import Attribute, Type
 from .record import Record
 
@@ -134,6 +135,7 @@ class BaseProtocol(CoreProtocol, Generic[_Record]):
         args: Sequence[object],
         portal_name: str,
         timeout: _TimeoutType,
+        size_limits: SizeLimits | None = ...,
     ) -> Any: ...
     @overload
     async def bind_execute(
@@ -144,6 +146,7 @@ class BaseProtocol(CoreProtocol, Generic[_Record]):
         limit: int,
         return_extra: Literal[False],
         timeout: _TimeoutType,
+        size_limits: SizeLimits | None = ...,
     ) -> list[_OtherRecord]: ...
     @overload
     async def bind_execute(
@@ -154,6 +157,7 @@ class BaseProtocol(CoreProtocol, Generic[_Record]):
         limit: int,
         return_extra: Literal[True],
         timeout: _TimeoutType,
+        size_limits: SizeLimits | None = ...,
     ) -> tuple[list[_OtherRecord], bytes, bool]: ...
     @overload
     async def bind_execute(
@@ -164,6 +168,7 @@ class BaseProtocol(CoreProtocol, Generic[_Record]):
         limit: int,
         return_extra: bool,
         timeout: _TimeoutType,
+        size_limits: SizeLimits | None = ...,
     ) -> list[_OtherRecord] | tuple[list[_OtherRecord], bytes, bool]: ...
     async def bind_execute_many(
         self,
@@ -171,6 +176,7 @@ class BaseProtocol(CoreProtocol, Generic[_Record]):
         args: Iterable[Sequence[object]],
         portal_name: str,
         timeout: _TimeoutType,
+        size_limits: SizeLimits | None = ...,
     ) -> None: ...
     async def close(self, timeout: _TimeoutType) -> None: ...
     def _get_timeout(self, timeout: _TimeoutType) -> float | None: ...

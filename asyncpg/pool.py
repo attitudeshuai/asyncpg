@@ -1136,7 +1136,13 @@ def create_pool(dsn=None, *,
 
     :param \*\*connect_kwargs:
         Keyword arguments for the :func:`~asyncpg.connection.connect`
-        function.
+        function.  This includes the client-side size-limit arguments
+        (``query_max_length``, ``parameter_max_length``,
+        ``row_max_length`` and ``message_max_length``), which then
+        apply to every connection created by the pool.  Per-call
+        overrides can still be passed as ``size_limits`` to the query
+        methods of an acquired connection; such overrides are scoped to
+        that single call and do not change the pool defaults.
 
     :param Connection connection_class:
         The class to use for connections.  Must be a subclass of

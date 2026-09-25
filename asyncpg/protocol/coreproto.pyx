@@ -37,9 +37,17 @@ cdef class CoreProtocol:
         self.encoding = 'utf-8'
         # type of `scram` is `SCRAMAuthentcation`
         self.scram = None
-        # type of `gss_ctx` is `gssapi.SecurityContext` or
+        # type of gss_ctx is `gssapi.SecurityContext` or
         # `sspilib.SecurityContext`
         self.gss_ctx = None
+
+        # limits used by the executemany bind-message builder
+        self._execute_limits = None
+
+        # Effective size limits of the operation currently in
+        # progress; an `asyncpg.SizeLimits` instance, or None when
+        # no limits are configured.
+        self.size_limits = None
 
         self._reset_result()
 
@@ -62,6 +70,12 @@ cdef class CoreProtocol:
             state = self.state
 
             try:
+                # Enforce the configured result-row and protocol-message
+                # size limits before dispatching the message.  A failure
+                # here is caught below and routes the protocol into the
+                # discard-till-sync mode, keeping the connection usable.
+                self._check_incoming_message_limits(mtype)
+
                 if mtype == b'S':
                     # ParameterStatus
                     self._parse_msg_parameter_status()
@@ -460,17 +474,165 @@ cdef class CoreProtocol:
             # be processed by the next protocol iteration.
             buf.put_message()
 
-    cdef _write_copy_data_msg(self, object data):
+    cdef _check_query_size_limit(self, str query, object limits):
+        cdef ssize_t qlen
+
+        if limits is None or limits.query_max_length is None:
+            return
+
+        qlen = len(query.encode(self.encoding))
+        if qlen > <ssize_t>limits.query_max_length:
+            raise apg_exc.QueryTextSizeLimitError(
+                f'query text length ({qlen} bytes) exceeds the configured '
+                f'query_max_length limit '
+                f'({limits.query_max_length} bytes)',
+                size=qlen,
+                limit=<ssize_t>limits.query_max_length)
+
+    cdef _check_outgoing_message_size(self, WriteBuffer packet,
+                                      object limits):
+        cdef ssize_t plen
+
+        if limits is None or limits.message_max_length is None:
+            return
+
+        plen = packet.len()
+        if plen > <ssize_t>limits.message_max_length:
+            raise apg_exc.MessageSizeLimitError(
+                f'protocol message size ({plen} bytes) exceeds the '
+                f'configured message_max_length limit '
+                f'({limits.message_max_length} bytes)',
+                size=plen,
+                limit=<ssize_t>limits.message_max_length)
+
+    cdef _check_query_message_size(self, str query, object limits):
+        cdef WriteBuffer buf
+
+        if limits is None or limits.message_max_length is None:
+            return
+
+        buf = WriteBuffer.new_message(b'Q')
+        buf.write_str(query, self.encoding)
+        buf.end_message()
+        self._check_outgoing_message_size(buf, limits)
+
+    cdef object _make_result_row_size_error(self, ssize_t size):
+        cdef object limits = self.size_limits
+        return apg_exc.ResultRowSizeLimitError(
+            f'result row size ({size} bytes) exceeds the configured '
+            f'row_max_length limit ({limits.row_max_length} bytes)',
+            size=size,
+            limit=<ssize_t>limits.row_max_length)
+
+    cdef object _make_message_size_error(self, ssize_t size):
+        cdef object limits = self.size_limits
+        return apg_exc.MessageSizeLimitError(
+            f'protocol message size ({size} bytes) exceeds the configured '
+            f'message_max_length limit ({limits.message_max_length} bytes)',
+            size=size,
+            limit=<ssize_t>limits.message_max_length)
+
+    cdef _check_incoming_message_limits(self, char mtype):
+        cdef:
+            int32_t mlen
+            ssize_t payload_len
+            ssize_t wire_len
+            object limits = self.size_limits
+
+        if limits is None:
+            return
+
+        # Asynchronous ParameterStatus ('S'), NotificationResponse ('A')
+        # and NoticeResponse ('N') messages are not bounded by the
+        # request/result size limits.
+        if mtype == b'S' or mtype == b'A' or mtype == b'N':
+            return
+
+        mlen = self.buffer.get_message_length()
+
+        # For DataRow messages the specific row_max_length limit is
+        # checked *before* the generic message_max_length limit, so a
+        # row violating both is reported as a row-size error.  The
+        # generic limit applies afterwards and to every other message.
+        if mtype == b'D' and limits.row_max_length is not None:
+            payload_len = <ssize_t>mlen - 4
+            if payload_len > <ssize_t>limits.row_max_length:
+                raise self._make_result_row_size_error(payload_len)
+
+        if limits.message_max_length is not None:
+            wire_len = <ssize_t>mlen + 1
+            if wire_len > <ssize_t>limits.message_max_length:
+                raise self._make_message_size_error(wire_len)
+
+    cdef object _get_pending_oversized_error(self):
+        # Detect an oversized message as soon as its 5-byte header has
+        # been received, i.e. potentially before the (oversized) body
+        # has to be buffered.  Returns a client exception, or None.
+        cdef:
+            char mtype
+            int32_t mlen
+            ssize_t payload_len
+            ssize_t wire_len
+            object limits = self.size_limits
+
+        if limits is None:
+            return None
+
+        if self.buffer.take_message() == 1:
+            # The message is complete; it is handled by the regular
+            # read loop (which applies the same limits, in order).
+            return None
+
+        if self.buffer._current_message_len == 0:
+            # The message length field has not been received yet.
+            return None
+
+        mtype = self.buffer.get_message_type()
+        if mtype == b'S' or mtype == b'A' or mtype == b'N':
+            return None
+
+        mlen = self.buffer.get_message_length()
+
+        if mtype == b'D' and limits.row_max_length is not None:
+            payload_len = <ssize_t>mlen - 4
+            if payload_len > <ssize_t>limits.row_max_length:
+                return self._make_result_row_size_error(payload_len)
+
+        if limits.message_max_length is not None:
+            wire_len = <ssize_t>mlen + 1
+            if wire_len > <ssize_t>limits.message_max_length:
+                return self._make_message_size_error(wire_len)
+
+        return None
+
+    cdef _write_copy_data_msg(self, object data, object limits):
         cdef:
             WriteBuffer buf
             object mview
             Py_buffer *pybuf
+            ssize_t data_len
+            object msg_limit
 
         mview = cpythonx.PyMemoryView_GetContiguous(
             data, cpython.PyBUF_READ, b'C')
 
         try:
             pybuf = cpythonx.PyMemoryView_GET_BUFFER(mview)
+            data_len = pybuf.len
+
+            # A CopyData message is a regular protocol message framing
+            # 1 type byte, 4 length-field bytes and the payload.  The
+            # check runs before anything is handed to the transport.
+            if limits is not None:
+                msg_limit = limits.message_max_length
+                if (msg_limit is not None and
+                        data_len + 5 > <ssize_t>msg_limit):
+                    raise apg_exc.MessageSizeLimitError(
+                        f'COPY data message size ({data_len + 5} bytes) '
+                        f'exceeds the configured message_max_length limit '
+                        f'({msg_limit} bytes)',
+                        size=<ssize_t>(data_len + 5),
+                        limit=<ssize_t>msg_limit)
 
             buf = WriteBuffer.new_message(b'd')
             buf.write_cstr(<const char *>pybuf.buf, pybuf.len)
@@ -879,7 +1041,8 @@ cdef class CoreProtocol:
         if self.con_status != CONNECTION_OK:
             raise apg_exc.InternalClientError('not connected')
 
-    cdef WriteBuffer _build_parse_message(self, str stmt_name, str query):
+    cdef WriteBuffer _build_parse_message(self, str stmt_name, str query,
+                                         object limits=None):
         cdef WriteBuffer buf
 
         buf = WriteBuffer.new_message(b'P')
@@ -888,11 +1051,13 @@ cdef class CoreProtocol:
         buf.write_int16(0)
 
         buf.end_message()
+        self._check_outgoing_message_size(buf, limits)
         return buf
 
     cdef WriteBuffer _build_bind_message(self, str portal_name,
                                          str stmt_name,
-                                         WriteBuffer bind_data):
+                                         WriteBuffer bind_data,
+                                         object limits=None):
         cdef WriteBuffer buf
 
         buf = WriteBuffer.new_message(b'B')
@@ -903,6 +1068,7 @@ cdef class CoreProtocol:
         buf.write_buffer(bind_data)
 
         buf.end_message()
+        self._check_outgoing_message_size(buf, limits)
         return buf
 
     cdef WriteBuffer _build_empty_bind_data(self):
@@ -966,15 +1132,17 @@ cdef class CoreProtocol:
         outbuf.write_buffer(buf)
         self._write(outbuf)
 
-    cdef _send_parse_message(self, str stmt_name, str query):
+    cdef _send_parse_message(self, str stmt_name, str query,
+                             object limits=None):
         cdef:
             WriteBuffer msg
 
         self._ensure_connected()
-        msg = self._build_parse_message(stmt_name, query)
+        msg = self._build_parse_message(stmt_name, query, limits)
         self._write(msg)
 
-    cdef _prepare_and_describe(self, str stmt_name, str query):
+    cdef _prepare_and_describe(self, str stmt_name, str query,
+                               object limits=None):
         cdef:
             WriteBuffer packet
             WriteBuffer buf
@@ -982,7 +1150,7 @@ cdef class CoreProtocol:
         self._ensure_connected()
         self._set_state(PROTOCOL_PREPARE)
 
-        packet = self._build_parse_message(stmt_name, query)
+        packet = self._build_parse_message(stmt_name, query, limits)
 
         buf = WriteBuffer.new_message(b'D')
         buf.write_byte(b'S')
@@ -995,13 +1163,15 @@ cdef class CoreProtocol:
         self._write(packet)
 
     cdef _send_bind_message(self, str portal_name, str stmt_name,
-                            WriteBuffer bind_data, int32_t limit):
+                            WriteBuffer bind_data, int32_t limit,
+                            object limits=None):
 
         cdef:
             WriteBuffer packet
             WriteBuffer buf
 
-        buf = self._build_bind_message(portal_name, stmt_name, bind_data)
+        buf = self._build_bind_message(
+            portal_name, stmt_name, bind_data, limits)
         packet = buf
 
         buf = self._build_execute_message(portal_name, limit)
@@ -1012,7 +1182,8 @@ cdef class CoreProtocol:
         self._write(packet)
 
     cdef _bind_execute(self, str portal_name, str stmt_name,
-                       WriteBuffer bind_data, int32_t limit):
+                       WriteBuffer bind_data, int32_t limit,
+                       object limits=None):
 
         cdef WriteBuffer buf
 
@@ -1021,10 +1192,12 @@ cdef class CoreProtocol:
 
         self.result = []
 
-        self._send_bind_message(portal_name, stmt_name, bind_data, limit)
+        self._send_bind_message(
+            portal_name, stmt_name, bind_data, limit, limits)
 
     cdef bint _bind_execute_many(self, str portal_name, str stmt_name,
-                                 object bind_data, bint return_rows):
+                                 object bind_data, bint return_rows,
+                                 object limits=None):
         self._ensure_connected()
         self._set_state(PROTOCOL_BIND_EXECUTE_MANY)
 
@@ -1033,6 +1206,7 @@ cdef class CoreProtocol:
         self._execute_iter = bind_data
         self._execute_portal_name = portal_name
         self._execute_stmt_name = stmt_name
+        self._execute_limits = limits
         return self._bind_execute_many_more(True)
 
     cdef bint _bind_execute_many_more(self, bint first=False):
@@ -1057,6 +1231,24 @@ cdef class CoreProtocol:
                     # grab one item from the input
                     buf = <WriteBuffer>next(self._execute_iter)
 
+                    # all good, append the bind/execute messages;
+                    # building the bind message may itself fail (e.g.
+                    # on a size-limit violation), which is handled by
+                    # the same atomicity rules as an input error.
+                    packet.write_buffer(
+                        self._build_bind_message(
+                            self._execute_portal_name,
+                            self._execute_stmt_name,
+                            buf,
+                            self._execute_limits,
+                        )
+                    )
+                    packet.write_buffer(
+                        self._build_execute_message(
+                            self._execute_portal_name, 0,
+                        )
+                    )
+
                 # reached the end of the input
                 except StopIteration:
                     if first:
@@ -1074,19 +1266,7 @@ cdef class CoreProtocol:
                     self._bind_execute_many_fail(ex, first)
                     return False
 
-                # all good, write to the buffer
                 first = False
-                packet.write_buffer(
-                    self._build_bind_message(
-                        self._execute_portal_name,
-                        self._execute_stmt_name,
-                        buf,
-                    )
-                )
-                packet.write_buffer(
-                    self._build_execute_message(self._execute_portal_name, 0,
-                    )
-                )
 
             # collected one buffer
             buffers.append(memoryview(packet))
@@ -1113,9 +1293,9 @@ cdef class CoreProtocol:
             # so we could safely ignore this warning.
             # GOTCHA: cannot use simple query message here, because it is
             # ignored if `ignore_till_sync` is set.
-            buf = self._build_parse_message('', 'ROLLBACK')
+            buf = self._build_parse_message('', 'ROLLBACK', None)
             buf.write_buffer(self._build_bind_message(
-                '', '', self._build_empty_bind_data()))
+                '', '', self._build_empty_bind_data(), None))
             buf.write_buffer(self._build_execute_message('', 0))
             buf.write_bytes(SYNC_MESSAGE)
             self._write(buf)
@@ -1135,14 +1315,15 @@ cdef class CoreProtocol:
         self._write(buf)
 
     cdef _bind(self, str portal_name, str stmt_name,
-               WriteBuffer bind_data):
+               WriteBuffer bind_data, object limits=None):
 
         cdef WriteBuffer buf
 
         self._ensure_connected()
         self._set_state(PROTOCOL_BIND)
 
-        buf = self._build_bind_message(portal_name, stmt_name, bind_data)
+        buf = self._build_bind_message(
+            portal_name, stmt_name, bind_data, limits)
 
         buf.write_bytes(SYNC_MESSAGE)
 
@@ -1168,16 +1349,17 @@ cdef class CoreProtocol:
 
         self._write(buf)
 
-    cdef _simple_query(self, str query):
+    cdef _simple_query(self, str query, object limits=None):
         cdef WriteBuffer buf
         self._ensure_connected()
         self._set_state(PROTOCOL_SIMPLE_QUERY)
         buf = WriteBuffer.new_message(b'Q')
         buf.write_str(query, self.encoding)
         buf.end_message()
+        self._check_outgoing_message_size(buf, limits)
         self._write(buf)
 
-    cdef _copy_out(self, str copy_stmt):
+    cdef _copy_out(self, str copy_stmt, object limits=None):
         cdef WriteBuffer buf
 
         self._ensure_connected()
@@ -1187,9 +1369,10 @@ cdef class CoreProtocol:
         buf = WriteBuffer.new_message(b'Q')
         buf.write_str(copy_stmt, self.encoding)
         buf.end_message()
+        self._check_outgoing_message_size(buf, limits)
         self._write(buf)
 
-    cdef _copy_in(self, str copy_stmt):
+    cdef _copy_in(self, str copy_stmt, object limits=None):
         cdef WriteBuffer buf
 
         self._ensure_connected()
@@ -1198,6 +1381,7 @@ cdef class CoreProtocol:
         buf = WriteBuffer.new_message(b'Q')
         buf.write_str(copy_stmt, self.encoding)
         buf.end_message()
+        self._check_outgoing_message_size(buf, limits)
         self._write(buf)
 
     cdef _terminate(self):

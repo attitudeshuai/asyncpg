@@ -77,6 +77,7 @@ cdef class CoreProtocol:
         object _execute_iter
         str _execute_portal_name
         str _execute_stmt_name
+        object _execute_limits
 
         ConnectionStatus con_status
         ProtocolState state
@@ -107,6 +108,11 @@ cdef class CoreProtocol:
         # True - completed, False - suspended
         bint result_execute_completed
 
+        # Effective client-side size limits for the operation currently
+        # in progress (an asyncpg.SizeLimits instance, or None when
+        # no limits are configured).
+        object size_limits
+
     cpdef is_in_transaction(self)
     cdef _process__auth(self, char mtype)
     cdef _process__prepare(self, char mtype)
@@ -130,9 +136,18 @@ cdef class CoreProtocol:
     cdef _parse_msg_error_response(self, is_error)
     cdef _parse_msg_command_complete(self)
 
-    cdef _write_copy_data_msg(self, object data)
+    cdef _write_copy_data_msg(self, object data, object limits)
     cdef _write_copy_done_msg(self)
     cdef _write_copy_fail_msg(self, str cause)
+
+    cdef _check_query_size_limit(self, str query, object limits)
+    cdef _check_query_message_size(self, str query, object limits)
+    cdef _check_outgoing_message_size(self, WriteBuffer packet,
+                                      object limits)
+    cdef _check_incoming_message_limits(self, char mtype)
+    cdef object _get_pending_oversized_error(self)
+    cdef object _make_result_row_size_error(self, ssize_t size)
+    cdef object _make_message_size_error(self, ssize_t size)
 
     cdef _auth_password_message_cleartext(self)
     cdef _auth_password_message_md5(self, bytes salt)
@@ -154,33 +169,40 @@ cdef class CoreProtocol:
 
     cdef _ensure_connected(self)
 
-    cdef WriteBuffer _build_parse_message(self, str stmt_name, str query)
+    cdef WriteBuffer _build_parse_message(self, str stmt_name, str query,
+                                         object limits=*)
     cdef WriteBuffer _build_bind_message(self, str portal_name,
                                          str stmt_name,
-                                         WriteBuffer bind_data)
+                                         WriteBuffer bind_data,
+                                         object limits=*)
     cdef WriteBuffer _build_empty_bind_data(self)
     cdef WriteBuffer _build_execute_message(self, str portal_name,
                                             int32_t limit)
 
 
     cdef _connect(self)
-    cdef _prepare_and_describe(self, str stmt_name, str query)
-    cdef _send_parse_message(self, str stmt_name, str query)
+    cdef _prepare_and_describe(self, str stmt_name, str query,
+                               object limits=*)
+    cdef _send_parse_message(self, str stmt_name, str query,
+                             object limits=*)
     cdef _send_bind_message(self, str portal_name, str stmt_name,
-                            WriteBuffer bind_data, int32_t limit)
+                            WriteBuffer bind_data, int32_t limit,
+                            object limits=*)
     cdef _bind_execute(self, str portal_name, str stmt_name,
-                       WriteBuffer bind_data, int32_t limit)
+                       WriteBuffer bind_data, int32_t limit,
+                       object limits=*)
     cdef bint _bind_execute_many(self, str portal_name, str stmt_name,
-                                 object bind_data, bint return_rows)
+                                 object bind_data, bint return_rows,
+                                 object limits=*)
     cdef bint _bind_execute_many_more(self, bint first=*)
     cdef _bind_execute_many_fail(self, object error, bint first=*)
     cdef _bind(self, str portal_name, str stmt_name,
-               WriteBuffer bind_data)
+               WriteBuffer bind_data, object limits=*)
     cdef _execute(self, str portal_name, int32_t limit)
     cdef _close(self, str name, bint is_portal)
-    cdef _simple_query(self, str query)
-    cdef _copy_out(self, str copy_stmt)
-    cdef _copy_in(self, str copy_stmt)
+    cdef _simple_query(self, str query, object limits=*)
+    cdef _copy_out(self, str copy_stmt, object limits=*)
+    cdef _copy_in(self, str copy_stmt, object limits=*)
     cdef _terminate(self)
 
     cdef _decode_row(self, const char* buf, ssize_t buf_len)

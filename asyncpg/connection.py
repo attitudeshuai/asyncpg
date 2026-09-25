@@ -31,6 +31,7 @@ from . import protocol
 from . import serverversion
 from . import transaction
 from . import utils
+from .size_limits import SizeLimits
 
 
 class ConnectionMeta(type):
@@ -154,7 +155,11 @@ class Connection(metaclass=ConnectionMeta):
         """
         self._check_open()
         if channel not in self._listeners:
-            await self.fetch('LISTEN {}'.format(utils._quote_ident(channel)))
+            # LISTEN is part of the notification machinery, whose
+            # payloads are not bounded by the client size limits.
+            await self.fetch(
+                'LISTEN {}'.format(utils._quote_ident(channel)),
+                size_limits=SizeLimits())
             self._listeners[channel] = set()
         self._listeners[channel].add(_Callback.from_callable(callback))
 
@@ -170,7 +175,9 @@ class Connection(metaclass=ConnectionMeta):
         self._listeners[channel].remove(cb)
         if not self._listeners[channel]:
             del self._listeners[channel]
-            await self.fetch('UNLISTEN {}'.format(utils._quote_ident(channel)))
+            await self.fetch(
+                'UNLISTEN {}'.format(utils._quote_ident(channel)),
+                size_limits=SizeLimits())
 
     def add_log_listener(self, callback):
         """Add a listener for Postgres log messages.
@@ -276,6 +283,19 @@ class Connection(metaclass=ConnectionMeta):
         """
         return self._protocol.get_settings()
 
+    def get_size_limits(self) -> SizeLimits:
+        """Return the size limits configured on this connection."""
+        return self._config.size_limits
+
+    def _resolve_size_limits(self, size_limits) -> SizeLimits:
+        if size_limits is None:
+            return self._config.size_limits
+        if not isinstance(size_limits, SizeLimits):
+            raise exceptions.InterfaceError(
+                'size_limits is expected to be an asyncpg.SizeLimits '
+                'instance, got {!r}'.format(type(size_limits).__name__))
+        return size_limits
+
     def transaction(self, *, isolation=None, readonly=False,
                     deferrable=False):
         """Create a :class:`~transaction.Transaction` object.
@@ -316,6 +336,7 @@ class Connection(metaclass=ConnectionMeta):
         query: str,
         *args,
         timeout: typing.Optional[float]=None,
+        size_limits: typing.Optional[SizeLimits]=None,
     ) -> str:
         """Execute an SQL command (or commands).
 
@@ -339,19 +360,23 @@ class Connection(metaclass=ConnectionMeta):
 
         :param args: Query arguments.
         :param float timeout: Optional timeout value in seconds.
+        :param SizeLimits size_limits: Optional per-call override of the
+            client-side size limits.
         :return str: Status of the last SQL command.
 
         .. versionchanged:: 0.5.4
            Made it possible to pass query arguments.
         """
         self._check_open()
+        limits = self._resolve_size_limits(size_limits)
 
         if not args:
             if self._query_loggers:
                 with self._time_and_log(query, args, timeout):
-                    result = await self._protocol.query(query, timeout)
+                    result = await self._protocol.query(
+                        query, timeout, limits)
             else:
-                result = await self._protocol.query(query, timeout)
+                result = await self._protocol.query(query, timeout, limits)
             return result
 
         _, status, _ = await self._execute(
@@ -360,6 +385,7 @@ class Connection(metaclass=ConnectionMeta):
             0,
             timeout,
             return_status=True,
+            size_limits=limits,
         )
         return status.decode()
 
@@ -369,6 +395,7 @@ class Connection(metaclass=ConnectionMeta):
         args,
         *,
         timeout: typing.Optional[float]=None,
+        size_limits: typing.Optional[SizeLimits]=None,
     ):
         """Execute an SQL *command* for each sequence of arguments in *args*.
 
@@ -398,7 +425,9 @@ class Connection(metaclass=ConnectionMeta):
            ``executemany()`` was called in a transaction.
         """
         self._check_open()
-        return await self._executemany(command, args, timeout)
+        return await self._executemany(
+            command, args, timeout,
+            size_limits=self._resolve_size_limits(size_limits))
 
     async def _get_statement(
         self,
@@ -408,7 +437,8 @@ class Connection(metaclass=ConnectionMeta):
         named: typing.Union[str, bool, None] = False,
         use_cache=True,
         ignore_custom_codec=False,
-        record_class=None
+        record_class=None,
+        size_limits=None,
     ):
         if record_class is None:
             record_class = self._protocol.get_record_class()
@@ -446,6 +476,7 @@ class Connection(metaclass=ConnectionMeta):
             timeout,
             record_class=record_class,
             ignore_custom_codec=ignore_custom_codec,
+            size_limits=size_limits,
         )
         need_reprepare = False
         types_with_missing_codecs = statement._init_types()
@@ -570,7 +601,8 @@ class Connection(metaclass=ConnectionMeta):
         *args,
         prefetch=None,
         timeout=None,
-        record_class=None
+        record_class=None,
+        size_limits: typing.Optional[SizeLimits]=None,
     ):
         """Return a *cursor factory* for the specified query.
 
@@ -585,12 +617,14 @@ class Connection(metaclass=ConnectionMeta):
             If specified, the class to use for records returned by this cursor.
             Must be a subclass of :class:`~asyncpg.Record`.  If not specified,
             a per-connection *record_class* is used.
+        :param SizeLimits size_limits:
+            Optional per-call override of the client-side size limits.
 
         :return:
             A :class:`~cursor.CursorFactory` object.
 
         .. versionchanged:: 0.22.0
-            Added the *record_class* parameter.
+           Added the *record_class* parameter.
         """
         self._check_open()
         return cursor.CursorFactory(
@@ -601,6 +635,7 @@ class Connection(metaclass=ConnectionMeta):
             prefetch,
             timeout,
             record_class,
+            self._resolve_size_limits(size_limits),
         )
 
     async def prepare(
@@ -610,6 +645,7 @@ class Connection(metaclass=ConnectionMeta):
         name=None,
         timeout=None,
         record_class=None,
+        size_limits: typing.Optional[SizeLimits]=None,
     ):
         """Create a *prepared statement* for the specified query.
 
@@ -625,6 +661,8 @@ class Connection(metaclass=ConnectionMeta):
             prepared statement.  Must be a subclass of
             :class:`~asyncpg.Record`.  If not specified, a per-connection
             *record_class* is used.
+        :param SizeLimits size_limits:
+            Optional per-call override of the client-side size limits.
 
         :return:
             A :class:`~prepared_stmt.PreparedStatement` instance.
@@ -640,6 +678,7 @@ class Connection(metaclass=ConnectionMeta):
             name=name,
             timeout=timeout,
             record_class=record_class,
+            size_limits=self._resolve_size_limits(size_limits),
         )
 
     async def _prepare(
@@ -649,7 +688,8 @@ class Connection(metaclass=ConnectionMeta):
         name: typing.Union[str, bool, None] = None,
         timeout=None,
         use_cache: bool=False,
-        record_class=None
+        record_class=None,
+        size_limits=None,
     ):
         self._check_open()
         if name is None:
@@ -660,6 +700,7 @@ class Connection(metaclass=ConnectionMeta):
             named=name,
             use_cache=use_cache,
             record_class=record_class,
+            size_limits=size_limits,
         )
         return prepared_stmt.PreparedStatement(self, query, stmt)
 
@@ -668,7 +709,8 @@ class Connection(metaclass=ConnectionMeta):
         query,
         *args,
         timeout=None,
-        record_class=None
+        record_class=None,
+        size_limits: typing.Optional[SizeLimits]=None,
     ) -> list:
         """Run a query and return the results as a list of :class:`Record`.
 
@@ -697,9 +739,11 @@ class Connection(metaclass=ConnectionMeta):
             0,
             timeout,
             record_class=record_class,
+            size_limits=self._resolve_size_limits(size_limits),
         )
 
-    async def fetchval(self, query, *args, column=0, timeout=None):
+    async def fetchval(self, query, *args, column=0, timeout=None,
+                       size_limits: typing.Optional[SizeLimits]=None):
         """Run a query and return a value in the first row.
 
         :param str query: Query text.
@@ -715,7 +759,9 @@ class Connection(metaclass=ConnectionMeta):
                  None if no records were returned by the query.
         """
         self._check_open()
-        data = await self._execute(query, args, 1, timeout)
+        data = await self._execute(
+            query, args, 1, timeout,
+            size_limits=self._resolve_size_limits(size_limits))
         if not data:
             return None
         return data[0][column]
@@ -725,7 +771,8 @@ class Connection(metaclass=ConnectionMeta):
         query,
         *args,
         timeout=None,
-        record_class=None
+        record_class=None,
+        size_limits: typing.Optional[SizeLimits]=None,
     ):
         """Run a query and return the first row.
 
@@ -755,6 +802,7 @@ class Connection(metaclass=ConnectionMeta):
             1,
             timeout,
             record_class=record_class,
+            size_limits=self._resolve_size_limits(size_limits),
         )
         if not data:
             return None
@@ -767,6 +815,7 @@ class Connection(metaclass=ConnectionMeta):
         *,
         timeout: typing.Optional[float]=None,
         record_class=None,
+        size_limits: typing.Optional[SizeLimits]=None,
     ):
         """Run a query for each sequence of arguments in *args*
         and return the results as a list of :class:`Record`.
@@ -800,14 +849,16 @@ class Connection(metaclass=ConnectionMeta):
         """
         self._check_open()
         return await self._executemany(
-            query, args, timeout, return_rows=True, record_class=record_class
-        )
+            query, args, timeout, return_rows=True,
+            record_class=record_class,
+            size_limits=self._resolve_size_limits(size_limits))
 
     async def copy_from_table(self, table_name, *, output,
                               columns=None, schema_name=None, timeout=None,
                               format=None, oids=None, delimiter=None,
                               null=None, header=None, quote=None,
-                              escape=None, force_quote=None, encoding=None):
+                              escape=None, force_quote=None, encoding=None,
+                              size_limits=None):
         """Copy table contents to a file or file-like object.
 
         :param str table_name:
@@ -873,13 +924,15 @@ class Connection(metaclass=ConnectionMeta):
         copy_stmt = 'COPY {tab}{cols} TO STDOUT {opts}'.format(
             tab=tabname, cols=cols, opts=opts)
 
-        return await self._copy_out(copy_stmt, output, timeout)
+        return await self._copy_out(
+            copy_stmt, output, timeout,
+            size_limits=self._resolve_size_limits(size_limits))
 
     async def copy_from_query(self, query, *args, output,
                               timeout=None, format=None, oids=None,
                               delimiter=None, null=None, header=None,
                               quote=None, escape=None, force_quote=None,
-                              encoding=None):
+                              encoding=None, size_limits=None):
         """Copy the results of a query to a file or file-like object.
 
         :param str query:
@@ -935,7 +988,9 @@ class Connection(metaclass=ConnectionMeta):
         copy_stmt = 'COPY ({query}) TO STDOUT {opts}'.format(
             query=query, opts=opts)
 
-        return await self._copy_out(copy_stmt, output, timeout)
+        return await self._copy_out(
+            copy_stmt, output, timeout,
+            size_limits=self._resolve_size_limits(size_limits))
 
     async def copy_to_table(self, table_name, *, source,
                             columns=None, schema_name=None, timeout=None,
@@ -943,7 +998,7 @@ class Connection(metaclass=ConnectionMeta):
                             delimiter=None, null=None, header=None,
                             quote=None, escape=None, force_quote=None,
                             force_not_null=None, force_null=None,
-                            encoding=None, where=None):
+                            encoding=None, where=None, size_limits=None):
         """Copy data to the specified table.
 
         :param str table_name:
@@ -1023,11 +1078,14 @@ class Connection(metaclass=ConnectionMeta):
         copy_stmt = 'COPY {tab}{cols} FROM STDIN {opts} {cond}'.format(
             tab=tabname, cols=cols, opts=opts, cond=cond)
 
-        return await self._copy_in(copy_stmt, source, timeout)
+        return await self._copy_in(
+            copy_stmt, source, timeout,
+            size_limits=self._resolve_size_limits(size_limits))
 
     async def copy_records_to_table(self, table_name, *, records,
                                     columns=None, schema_name=None,
-                                    timeout=None, where=None):
+                                    timeout=None, where=None,
+                                    size_limits=None):
         """Copy a list of records to the specified table using binary COPY.
 
         :param str table_name:
@@ -1114,9 +1172,10 @@ class Connection(metaclass=ConnectionMeta):
             cols = ''
 
         intro_query = 'SELECT {cols} FROM {tab} LIMIT 1'.format(
-            tab=tabname, cols=col_list)
+            cols=col_list, tab=tabname)
 
-        intro_ps = await self.prepare(intro_query)
+        limits = self._resolve_size_limits(size_limits)
+        intro_ps = await self.prepare(intro_query, size_limits=limits)
 
         cond = self._format_copy_where(where)
         opts = '(FORMAT binary)'
@@ -1125,7 +1184,7 @@ class Connection(metaclass=ConnectionMeta):
             tab=tabname, cols=cols, opts=opts, cond=cond)
 
         return await self._protocol.copy_in(
-            copy_stmt, None, None, records, intro_ps._state, timeout)
+            copy_stmt, None, None, records, intro_ps._state, timeout, limits)
 
     def _format_copy_where(self, where):
         if where and not self._server_caps.sql_copy_from_where:
@@ -1168,7 +1227,7 @@ class Connection(metaclass=ConnectionMeta):
         else:
             return ''
 
-    async def _copy_out(self, copy_stmt, output, timeout):
+    async def _copy_out(self, copy_stmt, output, timeout, size_limits=None):
         try:
             path = os.fspath(output)
         except TypeError:
@@ -1202,12 +1261,13 @@ class Connection(metaclass=ConnectionMeta):
             writer = _writer
 
         try:
-            return await self._protocol.copy_out(copy_stmt, writer, timeout)
+            return await self._protocol.copy_out(
+                copy_stmt, writer, timeout, size_limits)
         finally:
             if opened_by_us:
                 f.close()
 
-    async def _copy_in(self, copy_stmt, source, timeout):
+    async def _copy_in(self, copy_stmt, source, timeout, size_limits=None):
         try:
             path = os.fspath(source)
         except TypeError:
@@ -1254,7 +1314,7 @@ class Connection(metaclass=ConnectionMeta):
 
         try:
             return await self._protocol.copy_in(
-                copy_stmt, reader, data, None, None, timeout)
+                copy_stmt, reader, data, None, None, timeout, size_limits)
         finally:
             if opened_by_us:
                 await run_in_executor(None, f.close)
@@ -1539,7 +1599,8 @@ class Connection(metaclass=ConnectionMeta):
                 })
 
             self._top_xact = None
-            await self.execute("ROLLBACK")
+            await self.execute(
+                "ROLLBACK", size_limits=SizeLimits())
 
     async def reset(self, *, timeout=None):
         """Reset the connection state.
@@ -1568,7 +1629,9 @@ class Connection(metaclass=ConnectionMeta):
             await self._reset()
             reset_query = self.get_reset_query()
             if reset_query:
-                await self.execute(reset_query)
+                # The reset query is issued by asyncpg itself, never by
+                # the user, so client-side size limits do not apply.
+                await self.execute(reset_query, size_limits=SizeLimits())
 
     def _abort(self):
         # Put the connection into the aborted state.
@@ -1867,7 +1930,8 @@ class Connection(metaclass=ConnectionMeta):
         *,
         return_status=False,
         ignore_custom_codec=False,
-        record_class=None
+        record_class=None,
+        size_limits=None,
     ):
         with self._stmt_exclusive_section:
             result, _ = await self.__execute(
@@ -1878,6 +1942,7 @@ class Connection(metaclass=ConnectionMeta):
                 return_status=return_status,
                 record_class=record_class,
                 ignore_custom_codec=ignore_custom_codec,
+                size_limits=size_limits,
             )
         return result
 
@@ -1946,7 +2011,8 @@ class Connection(metaclass=ConnectionMeta):
         *,
         return_status=False,
         ignore_custom_codec=False,
-        record_class=None
+        record_class=None,
+        size_limits=None,
     ):
         executor = lambda stmt, timeout: self._protocol.bind_execute(
             state=stmt,
@@ -1955,6 +2021,7 @@ class Connection(metaclass=ConnectionMeta):
             limit=limit,
             return_extra=return_status,
             timeout=timeout,
+            size_limits=size_limits,
         )
         timeout = self._protocol._get_timeout(timeout)
         if self._query_loggers:
@@ -1965,6 +2032,7 @@ class Connection(metaclass=ConnectionMeta):
                     timeout,
                     record_class=record_class,
                     ignore_custom_codec=ignore_custom_codec,
+                    size_limits=size_limits,
                 )
         else:
             result, stmt = await self._do_execute(
@@ -1973,6 +2041,7 @@ class Connection(metaclass=ConnectionMeta):
                 timeout,
                 record_class=record_class,
                 ignore_custom_codec=ignore_custom_codec,
+                size_limits=size_limits,
             )
         return result, stmt
 
@@ -1983,6 +2052,7 @@ class Connection(metaclass=ConnectionMeta):
         timeout,
         return_rows=False,
         record_class=None,
+        size_limits=None,
     ):
         executor = lambda stmt, timeout: self._protocol.bind_execute_many(
             state=stmt,
@@ -1990,13 +2060,14 @@ class Connection(metaclass=ConnectionMeta):
             portal_name='',
             timeout=timeout,
             return_rows=return_rows,
+            size_limits=size_limits,
         )
         timeout = self._protocol._get_timeout(timeout)
         with self._stmt_exclusive_section:
             with self._time_and_log(query, args, timeout):
                 result, _ = await self._do_execute(
-                    query, executor, timeout, record_class=record_class
-                )
+                    query, executor, timeout, record_class=record_class,
+                    size_limits=size_limits)
         return result
 
     async def _do_execute(
@@ -2007,7 +2078,8 @@ class Connection(metaclass=ConnectionMeta):
         retry=True,
         *,
         ignore_custom_codec=False,
-        record_class=None
+        record_class=None,
+        size_limits=None,
     ):
         if timeout is None:
             stmt = await self._get_statement(
@@ -2015,6 +2087,7 @@ class Connection(metaclass=ConnectionMeta):
                 None,
                 record_class=record_class,
                 ignore_custom_codec=ignore_custom_codec,
+                size_limits=size_limits,
             )
         else:
             before = time.monotonic()
@@ -2023,6 +2096,7 @@ class Connection(metaclass=ConnectionMeta):
                 timeout,
                 record_class=record_class,
                 ignore_custom_codec=ignore_custom_codec,
+                size_limits=size_limits,
             )
             after = time.monotonic()
             timeout -= after - before
@@ -2075,7 +2149,8 @@ class Connection(metaclass=ConnectionMeta):
                 raise
             else:
                 return await self._do_execute(
-                    query, executor, timeout, retry=False)
+                    query, executor, timeout, retry=False,
+                    size_limits=size_limits)
 
         return result, stmt
 
@@ -2099,7 +2174,11 @@ async def connect(dsn=None, *,
                   server_settings=None,
                   target_session_attrs=None,
                   krbsrvname=None,
-                  gsslib=None):
+                  gsslib=None,
+                  query_max_length=None,
+                  parameter_max_length=None,
+                  row_max_length=None,
+                  message_max_length=None):
     r"""A coroutine to establish a connection to a PostgreSQL server.
 
     The connection parameters may be specified either as a connection
@@ -2226,6 +2305,31 @@ async def connect(dsn=None, *,
     :param float command_timeout:
         The default timeout for operations on this connection
         (the default is ``None``: no timeout).
+
+    :param int query_max_length:
+        The maximum allowed length, in bytes, of an encoded query text.
+        ``None`` (the default) means no limit.  A query that exceeds
+        the limit is rejected client-side before anything is sent to
+        the server.
+
+    :param int parameter_max_length:
+        The maximum allowed length, in bytes, of a single encoded
+        query parameter.  ``None`` (the default) means no limit.  An
+        oversized parameter is rejected client-side before the query
+        is sent.
+
+    :param int row_max_length:
+        The maximum allowed length, in bytes, of a single result row
+        (the payload of a ``DataRow`` message).  ``None`` (the default)
+        means no limit.
+
+    :param int message_max_length:
+        The maximum allowed length, in bytes, of a single PostgreSQL
+        protocol message, including its framing.  ``None`` (the
+        default) means no limit.  The limits above can also be
+        overridden per call by passing an :class:`~asyncpg.SizeLimits`
+        instance as the ``size_limits`` keyword argument to a query
+        method.
 
     :param ssl:
         Pass ``True`` or an `ssl.SSLContext <SSLContext_>`_ instance to
@@ -2463,6 +2567,10 @@ async def connect(dsn=None, *,
             target_session_attrs=target_session_attrs,
             krbsrvname=krbsrvname,
             gsslib=gsslib,
+            query_max_length=query_max_length,
+            parameter_max_length=parameter_max_length,
+            row_max_length=row_max_length,
+            message_max_length=message_max_length,
         )
 
 
