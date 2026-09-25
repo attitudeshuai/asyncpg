@@ -49,6 +49,7 @@ class Connection(metaclass=ConnectionMeta):
     __slots__ = ('_protocol', '_transport', '_loop',
                  '_top_xact', '_aborted',
                  '_pool_release_ctr', '_stmt_cache', '_stmts_to_close',
+                 '_cursors',
                  '_stmt_cache_enabled',
                  '_listeners', '_server_version', '_server_caps',
                  '_intro_query', '_reset_query', '_proxy',
@@ -82,6 +83,8 @@ class Connection(metaclass=ConnectionMeta):
             max_lifetime=config.max_cached_statement_lifetime)
 
         self._stmts_to_close = set()
+        # Cursors (portals) currently associated with this connection.
+        self._cursors = set()
         self._stmt_cache_enabled = config.statement_cache_size > 0
 
         self._listeners = {}
@@ -1540,6 +1543,9 @@ class Connection(metaclass=ConnectionMeta):
 
             self._top_xact = None
             await self.execute("ROLLBACK")
+            # ROLLBACK destroys every non-holdable portal on the server,
+            # so all cursors opened on this connection are now invalid.
+            self._invalidate_cursors(cursor._INVALIDATED_MSG)
 
     async def reset(self, *, timeout=None):
         """Reset the connection state.
@@ -1587,6 +1593,10 @@ class Connection(metaclass=ConnectionMeta):
             self._proxy._holder._release_on_close()
 
         self._mark_stmts_as_closed()
+        # The server-side portals of any open cursors are gone together
+        # with the connection; mark the client-side handles closed so
+        # that no half-open registrations remain.
+        self._invalidate_cursors(cursor._CLOSED_MSG)
         self._listeners.clear()
         self._log_listeners.clear()
         self._query_loggers.clear()
@@ -1608,6 +1618,26 @@ class Connection(metaclass=ConnectionMeta):
         global _uid
         _uid += 1
         return '__asyncpg_{}_{:x}__'.format(prefix, _uid)
+
+    def _invalidate_cursors(self, reason=None):
+        # Mark every cursor associated with this connection as closed
+        # without contacting the server.  This is used when the portals
+        # are known to have ceased to exist: transaction commit/rollback,
+        # connection reset or connection close/terminate.
+        if reason is None:
+            reason = cursor._CLOSED_MSG
+        for cur in tuple(self._cursors):
+            cur._mark_closed(reason)
+
+    def _check_cursors(self):
+        if self._cursors:
+            count = len(self._cursors)
+            w = exceptions.InterfaceWarning(
+                '{conn!r} is being released to the pool but has {c} active '
+                'cursor{s}'.format(
+                    conn=self, c=count,
+                    s='s' if count > 1 else ''))
+            warnings.warn(w)
 
     def _mark_stmts_as_closed(self):
         for stmt in self._stmt_cache.iter_statements():
@@ -1788,6 +1818,9 @@ class Connection(metaclass=ConnectionMeta):
             'notification')
         self._check_listeners(
             self._log_listeners, 'log')
+        # Any cursors left open will be closed by the reset that
+        # follows, but warn the caller so the cleanup is observable.
+        self._check_cursors()
 
     def _drop_local_statement_cache(self):
         self._stmt_cache.clear()

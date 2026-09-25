@@ -8,6 +8,7 @@
 import enum
 
 from . import connresource
+from . import cursor as apg_cursor
 from . import exceptions as apg_errors
 
 
@@ -175,7 +176,8 @@ class Transaction(connresource.ConnectionResource):
     async def __commit(self):
         self.__check_state('commit')
 
-        if self._connection._top_xact is self:
+        is_top_xact = self._connection._top_xact is self
+        if is_top_xact:
             self._connection._top_xact = None
 
         if self._nested:
@@ -190,11 +192,18 @@ class Transaction(connresource.ConnectionResource):
             raise
         else:
             self._state = TransactionState.COMMITTED
+            if is_top_xact:
+                # COMMIT destroys every non-holdable portal on the
+                # server, so all cursors opened in this transaction
+                # are invalid client-side as well.
+                self._connection._invalidate_cursors(
+                    apg_cursor._INVALIDATED_MSG)
 
     async def __rollback(self):
         self.__check_state('rollback')
 
-        if self._connection._top_xact is self:
+        is_top_xact = self._connection._top_xact is self
+        if is_top_xact:
             self._connection._top_xact = None
 
         if self._nested:
@@ -209,6 +218,12 @@ class Transaction(connresource.ConnectionResource):
             raise
         else:
             self._state = TransactionState.ROLLEDBACK
+            if is_top_xact:
+                # ROLLBACK destroys every non-holdable portal on the
+                # server, so all cursors opened in this transaction
+                # are invalid client-side as well.
+                self._connection._invalidate_cursors(
+                    apg_cursor._INVALIDATED_MSG)
 
     @connresource.guarded
     async def commit(self):

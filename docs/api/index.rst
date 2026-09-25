@@ -216,6 +216,74 @@ It's also possible to create cursors from prepared statements:
    To create a cursor usable outside of a transaction, use the
    ``DECLARE ... CURSOR WITH HOLD`` SQL statement directly.
 
+Closing cursors
+---------------
+
+A cursor holds a server-side resource (a *portal*) that should be released
+as soon as the cursor is no longer needed.  Both
+:class:`~asyncpg.cursor.Cursor` and the asynchronous iterator returned by
+:class:`~asyncpg.cursor.CursorFactory` provide an explicit
+:meth:`~asyncpg.cursor.Cursor.close` coroutine and can also be used as
+asynchronous context managers::
+
+    async with con.transaction():
+        cur = await con.cursor('SELECT generate_series(0, 100)')
+        async with cur:
+            print(await cur.fetch(10))
+        # the portal is released here
+
+    async with con.transaction():
+        async with con.cursor('SELECT generate_series(0, 100)') as cur:
+            async for row in cur:
+                if row[0] == 10:
+                    break
+        # breaking out of the iteration early leaves the portal open,
+        # but exiting the context manager closes it deterministically
+
+The rules are:
+
+* ``close()`` sends the ``Close`` message for the portal immediately and
+  marks the cursor as closed, as reported by the
+  :attr:`~asyncpg.cursor.Cursor.closed` property.  Any subsequent attempt
+  to fetch or skip rows raises
+  :exc:`~asyncpg.exceptions.InterfaceError` -- no request for the stale
+  portal is ever sent to the server.
+
+* ``close()`` is idempotent.  Closing an already closed cursor (including a
+  cursor that was invalidated when its transaction ended) does nothing and
+  sends no request.
+
+* Closing a cursor never affects other cursors on the same connection.
+
+* When the top-level transaction is committed or rolled back, all cursors
+  opened in it are invalidated client-side, because the server destroys
+  their portals.  Fetching from such a cursor (even after starting a new
+  transaction) raises
+  :exc:`~asyncpg.exceptions.InterfaceError` explaining that the cursor is
+  closed; the cursor must be re-declared explicitly.  Releasing or rolling
+  back to a *savepoint* does not invalidate cursors.
+
+* When a connection is released back to a pool, asyncpg resets it (which
+  rolls back any open transaction and closes the portals) and invalidates
+  the stale cursor handles.  Releasing a connection that still has open
+  cursors emits an :class:`~asyncpg.exceptions.InterfaceWarning`.
+  Closing or otherwise using such a stale handle raises
+  :exc:`~asyncpg.exceptions.InterfaceError` and sends no request to the
+  server.  Closing or terminating a connection likewise invalidates every
+  cursor opened on it.
+
+* If a fetch or a skip on the cursor is in progress in another
+  :class:`~asyncio.Task` when ``close()`` is called, ``close()`` waits for
+  that operation to finish and only then closes the portal.  Rows already
+  returned by the in-progress operation remain delivered to its caller.
+
+* Iterating a cursor to exhaustion closes its portal automatically, as
+  before.
+
+.. versionadded:: 0.32.0
+   Explicit cursor closing, the ``closed`` property and asynchronous
+   context manager support.
+
 
 .. autoclass:: asyncpg.cursor.CursorFactory()
    :members:
@@ -230,9 +298,20 @@ It's also possible to create cursors from prepared statements:
       :class:`~asyncpg.cursor.Cursor` which can be used to navigate over and
       fetch subsets of the query results.
 
+   .. describe:: async with c as cur
+
+      Open an asynchronous iterator for the results and close it
+      deterministically on exit of the context manager block.
+
 
 .. autoclass:: asyncpg.cursor.Cursor()
    :members:
+
+   .. describe:: async with c
+
+      Close the cursor deterministically on exit of the context manager
+      block.  Any exception raised inside the block is propagated after the
+      cursor is closed.
 
 
 .. _asyncpg-api-pool:

@@ -5,10 +5,23 @@
 # the Apache 2.0 License: http://www.apache.org/licenses/LICENSE-2.0
 
 
+import asyncio
 import collections
 
 from . import connresource
 from . import exceptions
+
+
+#: Message used for cursors that were closed explicitly (or that never
+#: had a portal to close).
+_CLOSED_MSG = 'cursor is closed'
+
+#: Message used for cursors whose portal has been destroyed by the
+#: server as a result of the enclosing transaction being committed,
+#: rolled back or reset.
+_INVALIDATED_MSG = (
+    'cursor is closed: the transaction in which it was opened has ended'
+)
 
 
 class CursorFactory(connresource.ConnectionResource):
@@ -25,6 +38,7 @@ class CursorFactory(connresource.ConnectionResource):
         '_query',
         '_timeout',
         '_record_class',
+        '_iterator',
     )
 
     def __init__(
@@ -44,6 +58,7 @@ class CursorFactory(connresource.ConnectionResource):
         self._timeout = timeout
         self._state = state
         self._record_class = record_class
+        self._iterator = None
         if state is not None:
             state.attach()
 
@@ -74,6 +89,20 @@ class CursorFactory(connresource.ConnectionResource):
         )
         return cursor._init(self._timeout).__await__()
 
+    @connresource.guarded
+    async def __aenter__(self):
+        # Opening the factory as an async context manager yields an
+        # iterator that is deterministically closed on exit.
+        self._iterator = self.__aiter__()
+        return self._iterator
+
+    async def __aexit__(self, extype, ex, tb):
+        if self._iterator is not None:
+            iterator = self._iterator
+            self._iterator = None
+            await iterator.close()
+        return None
+
     def __del__(self):
         if self._state is not None:
             self._state.detach()
@@ -89,6 +118,9 @@ class BaseCursor(connresource.ConnectionResource):
         '_exhausted',
         '_query',
         '_record_class',
+        '_closed',
+        '_closed_reason',
+        '_lock',
     )
 
     def __init__(self, connection, query, state, args, record_class):
@@ -101,8 +133,39 @@ class BaseCursor(connresource.ConnectionResource):
         self._exhausted = False
         self._query = query
         self._record_class = record_class
+        self._closed = False
+        self._closed_reason = _CLOSED_MSG
+        # Serializes fetch/skip/close operations on this cursor so that
+        # an explicit close never races with an in-flight fetch.
+        self._lock = asyncio.Lock()
+        # Track this cursor on its connection so that transaction and
+        # connection lifecycle boundaries can invalidate it deterministically.
+        connection._cursors.add(self)
+
+    @property
+    def closed(self) -> bool:
+        """Indicates whether the cursor is closed.
+
+        A cursor becomes closed when :meth:`close` is called (including
+        when used as an asynchronous context manager), or when the
+        transaction it was opened in is committed, rolled back or reset.
+
+        .. versionadded:: 0.32.0
+        """
+        return self._closed
+
+    @connresource.guarded
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, extype, ex, tb):
+        await self.close()
+        return None
 
     def _check_ready(self):
+        if self._closed:
+            raise exceptions.InterfaceError(self._closed_reason)
+
         if self._state is None:
             raise exceptions.InterfaceError(
                 'cursor: no associated prepared statement')
@@ -166,11 +229,88 @@ class BaseCursor(connresource.ConnectionResource):
                 'cursor does not have an open portal')
 
         protocol = self._connection._protocol
-        await protocol.close_portal(self._portal_name, timeout)
+        portal_name = self._portal_name
+        # Forget the name before sending the request so that a failure
+        # of the close request itself can never result in a duplicate
+        # close of the same portal.
         self._portal_name = None
+        await protocol.close_portal(portal_name, timeout)
+        # The portal is gone, the cursor no longer holds server-side
+        # resources that require lifecycle cleanup.
+        self._connection._cursors.discard(self)
+
+    @connresource.guarded
+    async def close(self, *, timeout=None):
+        """Close the cursor by releasing its server-side *portal*.
+
+        The ``Close`` message for the portal is sent to the server
+        immediately and the cursor is marked as closed.  Any subsequent
+        attempt to fetch or skip rows using the cursor will raise
+        :exc:`~asyncpg.exceptions.InterfaceError`.
+
+        Closing a cursor is idempotent: closing a cursor that is already
+        closed (including a cursor that was invalidated by the end of its
+        transaction) does nothing and sends no request to the server.
+
+        If a fetch or a skip operation on this cursor is in progress in
+        another :class:`~asyncio.Task`, ``close()`` waits for that
+        operation to finish before closing the portal.  Rows already
+        returned by the in-progress operation remain delivered to its
+        caller.
+
+        If the request to close the portal fails, the cursor is still
+        marked as closed (it can never be closed twice), and the
+        underlying connection follows asyncpg's usual protocol-error
+        handling (it is terminated).  The original error is propagated
+        to the caller.
+
+        :param float timeout: Optional timeout value in seconds.
+
+        .. versionadded:: 0.32.0
+        """
+        if self._closed:
+            return
+
+        async with self._lock:
+            if self._closed:
+                return
+
+            portal_name = self._portal_name
+            # Clear the name before touching the network: this makes the
+            # transition to the closed state irreversible and guarantees
+            # that no duplicate close can ever be sent.
+            self._portal_name = None
+            try:
+                if portal_name is not None:
+                    await self._connection._protocol.close_portal(
+                        portal_name, timeout)
+            except BaseException:
+                self._mark_closed()
+                raise
+            self._mark_closed()
+
+    def _mark_closed(self, reason=_CLOSED_MSG):
+        # Local, network-free teardown.  Used by explicit close() and by
+        # the transaction/connection lifecycle hooks that know that the
+        # server-side portal has ceased to exist.
+        if not self._closed:
+            self._closed = True
+            self._closed_reason = reason
+            self._portal_name = None
+        try:
+            self._connection._cursors.discard(self)
+        except AttributeError:
+            pass
+        self._buffer_discard()
+
+    def _buffer_discard(self):
+        # Hook for CursorIterator to drop prefetched rows on close.
+        pass
 
     def __repr__(self):
         attrs = []
+        if self._closed:
+            attrs.append('closed')
         if self._exhausted:
             attrs.append('exhausted')
         attrs.append('')  # to separate from id
@@ -186,9 +326,19 @@ class BaseCursor(connresource.ConnectionResource):
             ' '.join(attrs), id(self))
 
     def __del__(self):
-        if self._state is not None:
-            self._state.detach()
-            self._connection._maybe_gc_stmt(self._state)
+        # Be defensive: __del__ may run for objects whose __init__
+        # failed before completing.
+        con = getattr(self, '_connection', None)
+        if con is None:
+            return
+        try:
+            con._cursors.discard(self)
+        except Exception:
+            pass
+        state = getattr(self, '_state', None)
+        if state is not None:
+            state.detach()
+            con._maybe_gc_stmt(state)
 
 
 class CursorIterator(BaseCursor):
@@ -205,15 +355,20 @@ class CursorIterator(BaseCursor):
         prefetch,
         timeout
     ):
-        super().__init__(connection, query, state, args, record_class)
-
         if prefetch <= 0:
             raise exceptions.InterfaceError(
                 'prefetch argument must be greater than zero')
 
+        super().__init__(connection, query, state, args, record_class)
+
         self._buffer = collections.deque()
         self._prefetch = prefetch
         self._timeout = timeout
+
+    def _buffer_discard(self):
+        buffer = getattr(self, '_buffer', None)
+        if buffer is not None:
+            buffer.clear()
 
     @connresource.guarded
     def __aiter__(self):
@@ -221,30 +376,37 @@ class CursorIterator(BaseCursor):
 
     @connresource.guarded
     async def __anext__(self):
-        if self._state is None:
-            self._state = await self._connection._get_statement(
-                self._query,
-                self._timeout,
-                named=True,
-                record_class=self._record_class,
-            )
-            self._state.attach()
+        if self._closed:
+            raise exceptions.InterfaceError(self._closed_reason)
 
-        if not self._portal_name and not self._exhausted:
-            buffer = await self._bind_exec(self._prefetch, self._timeout)
-            self._buffer.extend(buffer)
+        async with self._lock:
+            if self._closed:
+                raise exceptions.InterfaceError(self._closed_reason)
 
-        if not self._buffer and not self._exhausted:
-            buffer = await self._exec(self._prefetch, self._timeout)
-            self._buffer.extend(buffer)
+            if self._state is None:
+                self._state = await self._connection._get_statement(
+                    self._query,
+                    self._timeout,
+                    named=True,
+                    record_class=self._record_class,
+                )
+                self._state.attach()
 
-        if self._portal_name and self._exhausted:
-            await self._close_portal(self._timeout)
+            if not self._portal_name and not self._exhausted:
+                buffer = await self._bind_exec(self._prefetch, self._timeout)
+                self._buffer.extend(buffer)
 
-        if self._buffer:
-            return self._buffer.popleft()
+            if not self._buffer and not self._exhausted:
+                buffer = await self._exec(self._prefetch, self._timeout)
+                self._buffer.extend(buffer)
 
-        raise StopAsyncIteration
+            if self._portal_name and self._exhausted:
+                await self._close_portal(self._timeout)
+
+            if self._buffer:
+                return self._buffer.popleft()
+
+            raise StopAsyncIteration
 
 
 class Cursor(BaseCursor):
@@ -273,15 +435,16 @@ class Cursor(BaseCursor):
 
         :return: A list of :class:`Record` instances.
         """
-        self._check_ready()
-        if n <= 0:
-            raise exceptions.InterfaceError('n must be greater than zero')
-        if self._exhausted:
-            return []
-        recs = await self._exec(n, timeout)
-        if len(recs) < n:
-            self._exhausted = True
-        return recs
+        async with self._lock:
+            self._check_ready()
+            if n <= 0:
+                raise exceptions.InterfaceError('n must be greater than zero')
+            if self._exhausted:
+                return []
+            recs = await self._exec(n, timeout)
+            if len(recs) < n:
+                self._exhausted = True
+            return recs
 
     @connresource.guarded
     async def fetchrow(self, *, timeout=None):
@@ -291,14 +454,15 @@ class Cursor(BaseCursor):
 
         :return: A :class:`Record` instance.
         """
-        self._check_ready()
-        if self._exhausted:
-            return None
-        recs = await self._exec(1, timeout)
-        if len(recs) < 1:
-            self._exhausted = True
-            return None
-        return recs[0]
+        async with self._lock:
+            self._check_ready()
+            if self._exhausted:
+                return None
+            recs = await self._exec(1, timeout)
+            if len(recs) < 1:
+                self._exhausted = True
+                return None
+            return recs[0]
 
     @connresource.guarded
     async def forward(self, n, *, timeout=None) -> int:
@@ -308,16 +472,17 @@ class Cursor(BaseCursor):
 
         :return: A number of rows actually skipped over (<= *n*).
         """
-        self._check_ready()
-        if n <= 0:
-            raise exceptions.InterfaceError('n must be greater than zero')
+        async with self._lock:
+            self._check_ready()
+            if n <= 0:
+                raise exceptions.InterfaceError('n must be greater than zero')
 
-        protocol = self._connection._protocol
-        status = await protocol.query('MOVE FORWARD {:d} {}'.format(
-            n, self._portal_name), timeout)
+            protocol = self._connection._protocol
+            status = await protocol.query('MOVE FORWARD {:d} {}'.format(
+                n, self._portal_name), timeout)
 
-        advanced = int(status.split()[1])
-        if advanced < n:
-            self._exhausted = True
+            advanced = int(status.split()[1])
+            if advanced < n:
+                self._exhausted = True
 
-        return advanced
+            return advanced
