@@ -14,6 +14,7 @@ import asyncio
 import builtins
 import codecs
 import collections.abc
+import inspect
 import socket
 import time
 import weakref
@@ -71,6 +72,162 @@ include "prepared_stmt.pyx"
 
 
 NO_TIMEOUT = object()
+
+
+cdef class CopyContext:
+    """Per-COPY state: progress counters, chunking and abort flag."""
+
+    cdef:
+        ssize_t rows_count
+        ssize_t bytes_count
+        ssize_t chunk_size
+        object callback
+        double interval
+        ssize_t interval_bytes
+        object abort_handle
+        bint _aborting
+        double _last_ts
+        ssize_t _last_bytes
+
+    def __init__(self, ssize_t chunk_size, object callback,
+                 double interval, ssize_t interval_bytes,
+                 object abort_handle):
+        self.rows_count = 0
+        self.bytes_count = 0
+        self.chunk_size = chunk_size
+        self.callback = callback
+        self.interval = interval
+        self.interval_bytes = interval_bytes
+        self.abort_handle = abort_handle
+        self._aborting = False
+        self._last_ts = 0.0
+        self._last_bytes = 0
+
+        if abort_handle is not None:
+            if abort_handle._pending:
+                self._aborting = True
+                abort_handle._pending = False
+            abort_handle._context = self
+
+    cdef inline bint is_aborting(self):
+        return self._aborting
+
+    def request_abort(self):
+        self._aborting = True
+
+    cdef teardown(self):
+        if self.abort_handle is not None:
+            self.abort_handle._context = None
+            self.abort_handle = None
+        self.callback = None
+
+    cdef send(self, BaseProtocol proto, object data, ssize_t n,
+              bint count_rows, ssize_t known_rows=0):
+        cdef:
+            object mview, piece
+            cpython.Py_buffer *pybuf
+            const char* cbuf
+            ssize_t off, piece_len, piece_rows, i
+
+        if self.chunk_size <= 0 or n <= self.chunk_size:
+            proto._write_copy_data_msg(data)
+            if count_rows:
+                self.rows_count += self._count_newlines(data, n)
+        else:
+            mview = cpythonx.PyMemoryView_GetContiguous(
+                data, cpython.PyBUF_READ, b'C')
+            try:
+                pybuf = cpythonx.PyMemoryView_GET_BUFFER(mview)
+                off = 0
+                while off < n:
+                    piece_len = n - off
+                    if piece_len > self.chunk_size:
+                        piece_len = self.chunk_size
+                    # A memoryview slice shares the underlying buffer
+                    # without copying the data.
+                    piece = mview[off:off + piece_len]
+                    proto._write_copy_data_msg(piece)
+                    if count_rows:
+                        cbuf = <const char *>pybuf.buf + off
+                        piece_rows = 0
+                        for i in range(piece_len):
+                            if cbuf[i] == 10:
+                                piece_rows += 1
+                        self.rows_count += piece_rows
+                    off += piece_len
+            finally:
+                mview.release()
+
+        self.rows_count += known_rows
+        self.bytes_count += n
+
+    cdef ssize_t _count_newlines(self, object data, ssize_t n) except -1:
+        cdef:
+            object mview
+            cpython.Py_buffer *pybuf
+            const char* cbuf
+            ssize_t i, rows = 0
+
+        mview = cpythonx.PyMemoryView_GetContiguous(
+            data, cpython.PyBUF_READ, b'C')
+        try:
+            pybuf = cpythonx.PyMemoryView_GET_BUFFER(mview)
+            cbuf = <const char *>pybuf.buf
+            for i in range(n):
+                if cbuf[i] == 10:
+                    rows += 1
+        finally:
+            mview.release()
+        return rows
+
+    async def start(self):
+        if self.callback is not None:
+            await self._report(apg_types.COPY_PHASE_STARTING)
+
+    async def report(self):
+        if self.callback is not None:
+            await self._report(apg_types.COPY_PHASE_SENDING)
+
+    async def finish(self):
+        if self.callback is not None:
+            await self._report(apg_types.COPY_PHASE_DONE)
+
+    async def _report(self, str phase):
+        cdef:
+            double now
+            bint due
+            object res, progress
+
+        now = time.monotonic()
+
+        if (phase == apg_types.COPY_PHASE_STARTING or
+                phase == apg_types.COPY_PHASE_DONE):
+            due = True
+        elif self.interval > 0:
+            due = <bint>((now - self._last_ts) >= self.interval)
+            if not due and self.interval_bytes > 0:
+                due = <bint>(
+                    (self.bytes_count - self._last_bytes)
+                    >= self.interval_bytes)
+        elif self.interval_bytes > 0:
+            due = <bint>(
+                (self.bytes_count - self._last_bytes)
+                >= self.interval_bytes)
+        else:
+            due = True
+
+        if not due:
+            return
+
+        progress = apg_types.CopyProgress(
+            self.rows_count, self.bytes_count, phase)
+
+        res = self.callback(progress)
+        if inspect.isawaitable(res):
+            await res
+
+        self._last_ts = now
+        self._last_bytes = self.bytes_count
 
 
 cdef class BaseProtocol(CoreProtocol):
@@ -425,11 +582,20 @@ cdef class BaseProtocol(CoreProtocol):
         return status_msg
 
     async def copy_in(self, copy_stmt, reader, data,
-                      records, PreparedStatementState record_stmt, timeout):
+                      records, PreparedStatementState record_stmt, timeout,
+                      ssize_t chunk_size=-1, object progress_callback=None,
+                      double progress_interval=0.0,
+                      ssize_t progress_interval_bytes=0,
+                      object abort_handle=None):
         cdef:
             WriteBuffer wbuf
             ssize_t num_cols
             Codec codec
+            ssize_t wbuf_rows = 0
+            ssize_t flush_limit
+            CopyContext ctx
+            bint count_rows
+            object chunk
 
         if self.cancel_waiter is not None:
             await self.cancel_waiter
@@ -444,10 +610,19 @@ cdef class BaseProtocol(CoreProtocol):
 
         waiter = self._new_waiter(timer.get_remaining_budget())
 
+        self._copy_settled = False
+
+        ctx = CopyContext(
+            chunk_size, progress_callback, progress_interval,
+            progress_interval_bytes, abort_handle)
+        count_rows = progress_callback is not None
+
         # Initiate COPY IN.
         self._copy_in(copy_stmt)
 
         try:
+            await ctx.start()
+
             if record_stmt is not None:
                 # copy_in_records in binary mode
                 wbuf = WriteBuffer.new()
@@ -470,8 +645,15 @@ cdef class BaseProtocol(CoreProtocol):
                             'no binary format encoder for '
                             'type {} (OID {})'.format(codec.name, codec.oid))
 
+                if chunk_size > 0:
+                    flush_limit = chunk_size
+                else:
+                    flush_limit = _COPY_BUFFER_SIZE
+
                 if isinstance(records, collections.abc.AsyncIterable):
                     async for row in records:
+                        if ctx.is_aborting():
+                            break
                         # Tuple header
                         wbuf.write_int16(<int16_t>num_cols)
                         # Tuple data
@@ -484,13 +666,20 @@ cdef class BaseProtocol(CoreProtocol):
                                     codecs, i)
                                 codec.encode(settings, wbuf, item)
 
-                        if wbuf.len() >= _COPY_BUFFER_SIZE:
+                        wbuf_rows += 1
+
+                        if wbuf.len() >= flush_limit:
                             with timer:
                                 await self.writing_allowed.wait()
-                            self._write_copy_data_msg(wbuf)
+                            ctx.send(self, wbuf, wbuf.len(), False,
+                                     wbuf_rows)
+                            wbuf_rows = 0
                             wbuf = WriteBuffer.new()
+                            await ctx.report()
                 else:
                     for row in records:
+                        if ctx.is_aborting():
+                            break
                         # Tuple header
                         wbuf.write_int16(<int16_t>num_cols)
                         # Tuple data
@@ -503,15 +692,21 @@ cdef class BaseProtocol(CoreProtocol):
                                     codecs, i)
                                 codec.encode(settings, wbuf, item)
 
-                        if wbuf.len() >= _COPY_BUFFER_SIZE:
+                        wbuf_rows += 1
+
+                        if wbuf.len() >= flush_limit:
                             with timer:
                                 await self.writing_allowed.wait()
-                            self._write_copy_data_msg(wbuf)
+                            ctx.send(self, wbuf, wbuf.len(), False,
+                                     wbuf_rows)
+                            wbuf_rows = 0
                             wbuf = WriteBuffer.new()
+                            await ctx.report()
 
-                # End of binary copy.
-                wbuf.write_int16(-1)
-                self._write_copy_data_msg(wbuf)
+                if not ctx.is_aborting():
+                    # End of binary copy.
+                    wbuf.write_int16(-1)
+                    ctx.send(self, wbuf, wbuf.len(), False, wbuf_rows)
 
             elif reader is not None:
                 try:
@@ -527,20 +722,25 @@ cdef class BaseProtocol(CoreProtocol):
                         # rate of data messages.
                         with timer:
                             await self.writing_allowed.wait()
+                        if ctx.is_aborting():
+                            break
                         with timer:
                             chunk = await compat.wait_for(
                                 iterator.__anext__(),
                                 timeout=timer.get_remaining_budget())
-                        self._write_copy_data_msg(chunk)
+                        ctx.send(self, chunk, len(chunk), count_rows)
+                        await ctx.report()
                 except builtins.StopAsyncIteration:
                     pass
             else:
                 # Buffer passed in directly.
-                await self.writing_allowed.wait()
-                self._write_copy_data_msg(data)
+                with timer:
+                    await self.writing_allowed.wait()
+                if not ctx.is_aborting():
+                    ctx.send(self, data, len(data), count_rows)
 
         except asyncio.TimeoutError:
-            self._write_copy_fail_msg('TimeoutError')
+            self._copy_fail('TimeoutError', False)
             self._on_timeout(self.waiter)
             try:
                 await waiter
@@ -550,17 +750,38 @@ cdef class BaseProtocol(CoreProtocol):
                 raise apg_exc.InternalClientError('TimoutError was not raised')
 
         except (Exception, asyncio.CancelledError) as e:
-            self._write_copy_fail_msg(str(e))
-            self._request_cancel()
+            self._copy_fail(str(e), True)
             # Make asyncio shut up about unretrieved QueryCanceledError
             waiter.add_done_callback(lambda f: f.exception())
             raise
 
-        self._write_copy_done_msg()
+        else:
+            if ctx.is_aborting():
+                # The client requested that this COPY be aborted.  Send
+                # CopyFail so that the server discards the data, and wait
+                # for the failure acknowledgement so that the connection
+                # is ready for reuse when we raise.
+                if self.timeout_handle is not None:
+                    self.timeout_handle.cancel()
+                    self.timeout_handle = None
+                self._copy_fail('COPY operation aborted by client', False)
+                try:
+                    await waiter
+                except Exception:
+                    # Swallow the server-side failure (the COPY was
+                    # aborted deliberately); do not swallow a task
+                    # cancellation.
+                    pass
+                raise apg_exc.CopyAbortedError(
+                    'COPY operation was aborted by client')
 
-        status_msg = await waiter
+            await ctx.finish()
+            self._write_copy_done_msg()
 
-        return status_msg
+            return await waiter
+
+        finally:
+            ctx.teardown()
 
     async def close_statement(self, PreparedStatementState state, timeout):
         if self.cancel_waiter is not None:
@@ -641,6 +862,17 @@ cdef class BaseProtocol(CoreProtocol):
         finally:
             self.waiter = None
             self.transport.abort()
+
+    cdef _copy_fail(self, str cause, bint cancel):
+        # Terminal settlement of a COPY IN; called at most once per
+        # COPY so that CopyFail is not duplicated and cancellation is
+        # not requested twice even if several failure sources race.
+        if self._copy_settled:
+            return
+        self._copy_settled = True
+        self._write_copy_fail_msg(cause)
+        if cancel and self.cancel_waiter is None:
+            self._request_cancel()
 
     def _request_cancel(self):
         self.cancel_waiter = self.create_future()

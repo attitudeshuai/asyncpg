@@ -729,3 +729,384 @@ class TestCopyTo(tb.ConnectedTestCase):
                 'uuid', schema='pg_catalog'
             )
             await self.con.execute('DROP TABLE copytab')
+
+
+class TestCopyToProgress(tb.ConnectedTestCase):
+
+    async def test_copy_to_progress_bytes(self):
+        await self.con.execute('CREATE TABLE copyprog (a text)')
+        try:
+            reports = []
+
+            async def gen():
+                for _ in range(100):
+                    yield b'x\n'
+
+            res = await self.con.copy_to_table(
+                'copyprog',
+                source=gen(),
+                progress_callback=reports.append,
+                progress_interval_bytes=100)
+
+            self.assertEqual(res, 'COPY 100')
+            self.assertEqual(
+                (reports[0].rows_count, reports[0].bytes_count,
+                 reports[0].phase),
+                (0, 0, 'starting'))
+            sending = [r for r in reports if r.phase == 'sending']
+            self.assertEqual(
+                [(r.rows_count, r.bytes_count) for r in sending],
+                [(50, 100), (100, 200)])
+            self.assertEqual(
+                (reports[-1].rows_count, reports[-1].bytes_count,
+                 reports[-1].phase),
+                (100, 200, 'done'))
+            self.assertEqual(
+                await self.con.fetchval(
+                    'SELECT count(*) FROM copyprog'),
+                100)
+        finally:
+            await self.con.execute('DROP TABLE copyprog')
+
+    async def test_copy_to_progress_time(self):
+        await self.con.execute('CREATE TABLE copyprog (a text)')
+        try:
+            reports = []
+
+            async def gen():
+                for _ in range(10):
+                    await asyncio.sleep(0.03)
+                    yield b'x\n'
+
+            await self.con.copy_to_table(
+                'copyprog',
+                source=gen(),
+                progress_callback=reports.append,
+                progress_interval=0.05)
+
+            sending = [r for r in reports if r.phase == 'sending']
+            self.assertGreaterEqual(len(sending), 1)
+            self.assertEqual(reports[-1].phase, 'done')
+            self.assertEqual(reports[-1].rows_count, 10)
+            self.assertEqual(reports[-1].bytes_count, 20)
+        finally:
+            await self.con.execute('DROP TABLE copyprog')
+
+    async def test_copy_to_progress_sync_callback(self):
+        await self.con.execute('CREATE TABLE copyprog (a text)')
+        try:
+            reports = []
+
+            def cb(progress):
+                reports.append(progress)
+
+            async def gen():
+                for _ in range(20):
+                    yield b'x\n'
+
+            await self.con.copy_to_table(
+                'copyprog', source=gen(), progress_callback=cb,
+                progress_interval_bytes=10)
+
+            self.assertEqual(reports[-1].rows_count, 20)
+            self.assertEqual(
+                await self.con.fetchval(
+                    'SELECT count(*) FROM copyprog'), 20)
+        finally:
+            await self.con.execute('DROP TABLE copyprog')
+
+    async def test_copy_to_progress_chunk_size(self):
+        await self.con.execute('CREATE TABLE copyprog (a text)')
+        try:
+            async def gen():
+                # One chunk much larger than the configured chunk size.
+                yield b'x\n' * 500
+
+            await self.con.copy_to_table(
+                'copyprog', source=gen(), chunk_size=300)
+
+            self.assertEqual(
+                await self.con.fetchval(
+                    'SELECT count(*) FROM copyprog'), 500)
+
+            # Records path with a chunk size smaller than one row batch.
+            await self.con.execute(
+                'CREATE TABLE copyprog2 (a int)')
+            await self.con.copy_records_to_table(
+                'copyprog2',
+                records=[(i,) for i in range(100)],
+                chunk_size=64)
+            self.assertEqual(
+                await self.con.fetchval(
+                    'SELECT count(*) FROM copyprog2'), 100)
+        finally:
+            await self.con.execute(
+                'DROP TABLE IF EXISTS copyprog')
+            await self.con.execute(
+                'DROP TABLE IF EXISTS copyprog2')
+
+    async def test_copy_to_progress_callback_raises(self):
+        await self.con.execute('CREATE TABLE copyprog (a text)')
+        try:
+            class _Boom(Exception):
+                pass
+
+            async def cb(progress):
+                if progress.bytes_count > 0:
+                    raise _Boom('boom')
+
+            async def gen():
+                for _ in range(20):
+                    yield b'x\n'
+
+            with self.assertRaisesRegex(_Boom, 'boom'):
+                await self.con.copy_to_table(
+                    'copyprog', source=gen(),
+                    progress_callback=cb,
+                    progress_interval_bytes=1)
+
+            self.assertEqual(
+                await self.con.fetchval(
+                    'SELECT count(*) FROM copyprog'), 0)
+            self.assertEqual(
+                await self.con.fetchval('SELECT 1'), 1)
+        finally:
+            await self.con.execute('DROP TABLE copyprog')
+
+    async def test_copy_to_abort(self):
+        await self.con.execute('CREATE TABLE copyprog (a text)')
+        try:
+            handle = asyncpg.CopyAbortHandle()
+
+            async def cb(progress):
+                if progress.rows_count >= 30:
+                    handle.abort()
+
+            async def gen():
+                for _ in range(100):
+                    yield b'x\n'
+
+            with self.assertRaises(asyncpg.CopyAbortedError):
+                await self.con.copy_to_table(
+                    'copyprog', source=gen(),
+                    progress_callback=cb,
+                    progress_interval_bytes=1,
+                    abort_handle=handle)
+
+            self.assertEqual(
+                await self.con.fetchval(
+                    'SELECT count(*) FROM copyprog'), 0)
+            self.assertEqual(
+                await self.con.fetchval('SELECT 1'), 1)
+        finally:
+            await self.con.execute('DROP TABLE copyprog')
+
+    async def test_copy_to_abort_external(self):
+        await self.con.execute('CREATE TABLE copyprog (a text)')
+        try:
+            handle = asyncpg.CopyAbortHandle()
+
+            async def gen():
+                for _ in range(100):
+                    await asyncio.sleep(0.05)
+                    yield b'x\n'
+
+            task = asyncio.ensure_future(self.con.copy_to_table(
+                'copyprog', source=gen(), abort_handle=handle))
+
+            await asyncio.sleep(0.15)
+            handle.abort()
+
+            with self.assertRaises(asyncpg.CopyAbortedError):
+                await asyncio.wait_for(task, timeout=2)
+
+            self.assertEqual(
+                await self.con.fetchval(
+                    'SELECT count(*) FROM copyprog'), 0)
+            self.assertEqual(
+                await self.con.fetchval('SELECT 1'), 1)
+        finally:
+            await self.con.execute('DROP TABLE copyprog')
+
+    async def test_copy_to_abort_pending(self):
+        await self.con.execute('CREATE TABLE copyprog (a text)')
+        try:
+            handle = asyncpg.CopyAbortHandle()
+            handle.abort()
+
+            async def gen():
+                yield b'x\n'
+
+            with self.assertRaises(asyncpg.CopyAbortedError):
+                await self.con.copy_to_table(
+                    'copyprog', source=gen(), abort_handle=handle)
+
+            self.assertEqual(
+                await self.con.fetchval(
+                    'SELECT count(*) FROM copyprog'), 0)
+            self.assertEqual(
+                await self.con.fetchval('SELECT 1'), 1)
+        finally:
+            await self.con.execute('DROP TABLE copyprog')
+
+    async def test_copy_to_abort_timeout_race(self):
+        await self.con.execute('CREATE TABLE copyprog (a text)')
+        try:
+            handle = asyncpg.CopyAbortHandle()
+
+            async def gen():
+                await asyncio.sleep(5)
+                yield b'x\n'
+
+            task = asyncio.ensure_future(self.con.copy_to_table(
+                'copyprog', source=gen(), timeout=0.5,
+                abort_handle=handle))
+
+            await asyncio.sleep(0.1)
+            handle.abort()
+
+            try:
+                await asyncio.wait_for(task, timeout=3)
+            except (asyncpg.CopyAbortedError, asyncio.TimeoutError):
+                pass
+            else:
+                self.fail('COPY did not fail')
+
+            self.assertEqual(
+                await self.con.fetchval(
+                    'SELECT count(*) FROM copyprog'), 0)
+            self.assertEqual(
+                await self.con.fetchval('SELECT 1'), 1)
+        finally:
+            await self.con.execute('DROP TABLE copyprog')
+
+    async def test_copy_to_source_raises_with_callback(self):
+        await self.con.execute('CREATE TABLE copyprog (a text)')
+        try:
+            reports = []
+
+            async def gen():
+                yield b'x\n'
+                raise RuntimeError('source broke')
+
+            with self.assertRaisesRegex(RuntimeError, 'source broke'):
+                await self.con.copy_to_table(
+                    'copyprog', source=gen(),
+                    progress_callback=reports.append,
+                    progress_interval_bytes=1)
+
+            self.assertEqual(
+                await self.con.fetchval(
+                    'SELECT count(*) FROM copyprog'), 0)
+            self.assertEqual(
+                await self.con.fetchval('SELECT 1'), 1)
+        finally:
+            await self.con.execute('DROP TABLE copyprog')
+
+    async def test_copy_to_progress_repeated(self):
+        await self.con.execute('CREATE TABLE copyprog (a text)')
+        try:
+            async def gen(n):
+                for _ in range(n):
+                    yield b'x\n'
+
+            for n in (3, 5):
+                reports = []
+                handle = asyncpg.CopyAbortHandle()
+                await self.con.copy_to_table(
+                    'copyprog', source=gen(n),
+                    progress_callback=reports.append,
+                    abort_handle=handle)
+                self.assertEqual(reports[-1].rows_count, n)
+                self.assertIsNone(handle._context)
+
+            # An aborted COPY must not poison subsequent COPYs.
+            h = asyncpg.CopyAbortHandle()
+            h.abort()
+            with self.assertRaises(asyncpg.CopyAbortedError):
+                await self.con.copy_to_table(
+                    'copyprog', source=gen(2), abort_handle=h)
+            res = await self.con.copy_to_table(
+                'copyprog', source=gen(2))
+            self.assertEqual(res, 'COPY 2')
+        finally:
+            await self.con.execute('DROP TABLE copyprog')
+
+    async def test_copy_records_progress(self):
+        await self.con.execute('CREATE TABLE copyprog (a int)')
+        try:
+            reports = []
+
+            async def gen():
+                for i in range(100):
+                    yield (i,)
+
+            res = await self.con.copy_records_to_table(
+                'copyprog', records=gen(),
+                progress_callback=reports.append,
+                progress_interval_bytes=100,
+                chunk_size=200)
+
+            self.assertEqual(res, 'COPY 100')
+            self.assertEqual(reports[0].phase, 'starting')
+            self.assertEqual(reports[-1].phase, 'done')
+            self.assertEqual(reports[-1].rows_count, 100)
+            self.assertGreater(reports[-1].bytes_count, 0)
+            self.assertEqual(
+                await self.con.fetchval(
+                    'SELECT count(*) FROM copyprog'), 100)
+        finally:
+            await self.con.execute('DROP TABLE copyprog')
+
+    async def test_copy_records_abort(self):
+        await self.con.execute('CREATE TABLE copyprog (a int)')
+        try:
+            handle = asyncpg.CopyAbortHandle()
+
+            async def cb(progress):
+                if progress.rows_count >= 20:
+                    handle.abort()
+
+            async def gen():
+                for i in range(1000):
+                    yield (i,)
+
+            with self.assertRaises(asyncpg.CopyAbortedError):
+                await self.con.copy_records_to_table(
+                    'copyprog', records=gen(),
+                    progress_callback=cb,
+                    progress_interval_bytes=1,
+                    chunk_size=100,
+                    abort_handle=handle)
+
+            self.assertEqual(
+                await self.con.fetchval(
+                    'SELECT count(*) FROM copyprog'), 0)
+            self.assertEqual(
+                await self.con.fetchval('SELECT 1'), 1)
+        finally:
+            await self.con.execute('DROP TABLE copyprog')
+
+    async def test_copy_invalid_progress_params(self):
+        bad_kwargs = [
+            {'chunk_size': 0},
+            {'chunk_size': -1},
+            {'chunk_size': '100'},
+            {'chunk_size': True},
+            {'chunk_size': 2 ** 31},
+            {'progress_callback': 'nope'},
+            {'progress_interval': 1.0},
+            {'progress_interval_bytes': 100},
+            {'progress_interval': -1},
+            {'progress_interval_bytes': 0},
+            {'abort_handle': object()},
+        ]
+
+        for kw in bad_kwargs:
+            with self.assertRaises(ValueError):
+                await self.con.copy_to_table(
+                    'copyprog', source=b'', **kw)
+
+        with self.assertRaises(ValueError):
+            await self.con.copy_records_to_table(
+                'copyprog', records=[(1,)], chunk_size=0)

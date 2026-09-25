@@ -787,7 +787,12 @@ class Pool:
         force_not_null=None,
         force_null=None,
         encoding=None,
-        where=None
+        where=None,
+        progress_callback=None,
+        progress_interval=None,
+        progress_interval_bytes=None,
+        chunk_size=None,
+        abort_handle=None
     ):
         """Copy data to the specified table.
 
@@ -817,7 +822,12 @@ class Pool:
                 force_not_null=force_not_null,
                 force_null=force_null,
                 encoding=encoding,
-                where=where
+                where=where,
+                progress_callback=progress_callback,
+                progress_interval=progress_interval,
+                progress_interval_bytes=progress_interval_bytes,
+                chunk_size=chunk_size,
+                abort_handle=abort_handle
             )
 
     async def copy_records_to_table(
@@ -828,7 +838,12 @@ class Pool:
         columns=None,
         schema_name=None,
         timeout=None,
-        where=None
+        where=None,
+        progress_callback=None,
+        progress_interval=None,
+        progress_interval_bytes=None,
+        chunk_size=None,
+        abort_handle=None
     ):
         """Copy a list of records to the specified table using binary COPY.
 
@@ -846,7 +861,12 @@ class Pool:
                 columns=columns,
                 schema_name=schema_name,
                 timeout=timeout,
-                where=where
+                where=where,
+                progress_callback=progress_callback,
+                progress_interval=progress_interval,
+                progress_interval_bytes=progress_interval_bytes,
+                chunk_size=chunk_size,
+                abort_handle=abort_handle
             )
 
     def acquire(self, *, timeout=None):

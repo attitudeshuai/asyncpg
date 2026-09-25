@@ -20,7 +20,71 @@ if typing.TYPE_CHECKING:
 __all__ = (
     'Type', 'Attribute', 'Range', 'BitString', 'Point', 'Path', 'Polygon',
     'Box', 'Line', 'LineSegment', 'Circle', 'ServerVersion',
+    'CopyProgress', 'CopyAbortHandle',
+    'COPY_PHASE_STARTING', 'COPY_PHASE_SENDING', 'COPY_PHASE_DONE',
 )
+
+
+COPY_PHASE_STARTING: typing.Final = 'starting'
+COPY_PHASE_SENDING: typing.Final = 'sending'
+COPY_PHASE_DONE: typing.Final = 'done'
+
+
+class CopyProgress(typing.NamedTuple):
+    """Progress of a ``COPY ... FROM STDIN`` operation."""
+
+    rows_count: int
+    bytes_count: int
+    phase: str
+
+
+CopyProgress.__doc__ = 'Progress information of a COPY operation.'
+CopyProgress.rows_count.__doc__ = 'Number of rows sent to the server.'
+CopyProgress.bytes_count.__doc__ = \
+    'Number of payload bytes sent in CopyData messages.'
+CopyProgress.phase.__doc__ = (
+    'The current phase of the COPY operation: '
+    '"starting", "sending" or "done".')
+
+
+class CopyAbortHandle:
+    """A handle used to abort an in-progress ``COPY ... FROM STDIN``.
+
+    Instances are created by the caller, passed to
+    :meth:`asyncpg.Connection.copy_to_table` (or
+    :meth:`asyncpg.Connection.copy_records_to_table`) via the
+    *abort_handle* parameter, and can be signalled from any code by
+    calling :meth:`abort`.
+    """
+
+    __slots__ = ('_context', '_pending')
+
+    def __init__(self) -> None:
+        self._context: typing.Any = None
+        self._pending: bool = False
+
+    def abort(self) -> None:
+        """Request the associated COPY operation to be aborted.
+
+        The request is cooperative: the COPY loop stops before sending
+        the next data message and performs the COPY failure protocol,
+        so that the server discards all data received during this COPY.
+        """
+        if self._context is not None:
+            self._context.request_abort()
+        else:
+            # No COPY is currently using this handle; record the
+            # request so that the next COPY bound to this handle
+            # aborts immediately.
+            self._pending = True
+
+    @property
+    def aborted(self) -> bool:
+        """Whether :meth:`abort` has been requested."""
+        if self._pending:
+            return True
+        context = self._context
+        return context is not None and context.is_aborting()
 
 
 class Type(typing.NamedTuple):

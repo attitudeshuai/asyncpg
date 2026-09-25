@@ -15,7 +15,7 @@ __all__ = ('PostgresError', 'FatalPostgresError', 'UnknownPostgresError',
            'ClientConfigurationError',
            'InternalClientError', 'OutdatedSchemaCacheError', 'ProtocolError',
            'UnsupportedClientFeatureError', 'TargetServerAttributeNotMatched',
-           'UnsupportedServerFeatureError')
+           'UnsupportedServerFeatureError', 'CopyAbortedError')
 
 
 def _is_asyncpg_class(cls):
@@ -236,6 +236,10 @@ class UnsupportedClientFeatureError(InterfaceError):
 
 class UnsupportedServerFeatureError(InterfaceError):
     """Requested feature is unsupported by PostgreSQL server."""
+
+
+class CopyAbortedError(InterfaceError):
+    """The COPY operation was aborted by the client."""
 
 
 class InterfaceWarning(InterfaceMessage, UserWarning):

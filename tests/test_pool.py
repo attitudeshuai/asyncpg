@@ -1015,6 +1015,82 @@ class TestPool(tb.ConnectedTestCase):
         conn = await pool.acquire(timeout=POOL_NOMINAL_TIMEOUT)
         await pool.release(conn)
 
+    async def test_pool_copy_progress(self):
+        import gc
+        import weakref
+
+        pool = await self.create_pool(
+            database='postgres', min_size=1, max_size=1)
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute('''
+                    CREATE TABLE copyprog (a text);
+                    CREATE TABLE copyprog2 (a int);
+                ''')
+
+            def cb_factory():
+                def cb(progress):
+                    pass
+                return cb
+
+            cb = cb_factory()
+            ref = weakref.ref(cb)
+
+            async def gen():
+                for _ in range(10):
+                    yield b'x\n'
+
+            res = await pool.copy_to_table(
+                'copyprog', source=gen(),
+                progress_callback=cb,
+                progress_interval_bytes=5)
+            self.assertEqual(res, 'COPY 10')
+
+            del cb
+            gc.collect()
+            await asyncio.sleep(0)
+            self.assertIsNone(ref())
+
+            reports = []
+            res = await pool.copy_records_to_table(
+                'copyprog2',
+                records=[(i,) for i in range(10)],
+                progress_callback=reports.append,
+                progress_interval_bytes=10,
+                chunk_size=200)
+            self.assertEqual(res, 'COPY 10')
+            self.assertEqual(reports[-1].rows_count, 10)
+
+            async with pool.acquire() as conn:
+                await conn.execute('''
+                    DROP TABLE copyprog;
+                    DROP TABLE copyprog2;
+                ''')
+        finally:
+            await pool.close()
+
+    async def test_pool_copy_abort(self):
+        pool = await self.create_pool(
+            database='postgres', min_size=1, max_size=1)
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute('CREATE TABLE copyprog (a text)')
+
+            handle = asyncpg.CopyAbortHandle()
+            handle.abort()
+
+            async def gen():
+                yield b'x\n'
+
+            with self.assertRaises(asyncpg.CopyAbortedError):
+                await pool.copy_to_table(
+                    'copyprog', source=gen(), abort_handle=handle)
+
+            async with pool.acquire() as conn:
+                await conn.execute('DROP TABLE copyprog')
+        finally:
+            await pool.close()
+
 
 @unittest.skipIf(os.environ.get('PGHOST'), 'unmanaged cluster')
 class TestPoolReconnectWithTargetSessionAttrs(tb.ClusterTestCase):

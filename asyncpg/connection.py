@@ -30,7 +30,64 @@ from . import prepared_stmt
 from . import protocol
 from . import serverversion
 from . import transaction
+from . import types as apg_types
 from . import utils
+
+
+def _validate_copy_progress_options(*, chunk_size, progress_callback,
+                                    progress_interval,
+                                    progress_interval_bytes, abort_handle):
+    """Validate COPY progress/flow-control parameters before COPY starts."""
+
+    if chunk_size is not None:
+        if type(chunk_size) is not int:
+            raise ValueError(
+                'chunk_size is expected to be a positive integer, '
+                'not {}'.format(type(chunk_size).__name__))
+        if chunk_size <= 0 or chunk_size > 2 ** 31 - 1:
+            raise ValueError(
+                'chunk_size is expected to be a positive integer not '
+                'exceeding 2^31-1 (got {})'.format(chunk_size))
+
+    if progress_callback is not None and not callable(progress_callback):
+        raise ValueError(
+            'progress_callback is expected to be a callable, '
+            'not {}'.format(type(progress_callback).__name__))
+
+    if progress_interval is not None:
+        if type(progress_interval) is bool or \
+                not isinstance(progress_interval, (int, float)):
+            raise ValueError(
+                'progress_interval is expected to be a non-negative number, '
+                'not {}'.format(type(progress_interval).__name__))
+        if progress_interval < 0 or progress_interval != progress_interval:
+            raise ValueError(
+                'progress_interval is expected to be a non-negative number '
+                '(got {})'.format(progress_interval))
+        if progress_callback is None:
+            raise ValueError(
+                'progress_interval requires progress_callback to be set')
+
+    if progress_interval_bytes is not None:
+        if type(progress_interval_bytes) is not int:
+            raise ValueError(
+                'progress_interval_bytes is expected to be a positive '
+                'integer, not {}'.format(
+                    type(progress_interval_bytes).__name__))
+        if progress_interval_bytes <= 0:
+            raise ValueError(
+                'progress_interval_bytes is expected to be a positive '
+                'integer (got {})'.format(progress_interval_bytes))
+        if progress_callback is None:
+            raise ValueError(
+                'progress_interval_bytes requires progress_callback to '
+                'be set')
+
+    if abort_handle is not None and \
+            not isinstance(abort_handle, apg_types.CopyAbortHandle):
+        raise ValueError(
+            'abort_handle is expected to be an asyncpg.CopyAbortHandle '
+            'instance, not {}'.format(type(abort_handle).__name__))
 
 
 class ConnectionMeta(type):
@@ -943,7 +1000,10 @@ class Connection(metaclass=ConnectionMeta):
                             delimiter=None, null=None, header=None,
                             quote=None, escape=None, force_quote=None,
                             force_not_null=None, force_null=None,
-                            encoding=None, where=None):
+                            encoding=None, where=None,
+                            progress_callback=None, progress_interval=None,
+                            progress_interval_bytes=None, chunk_size=None,
+                            abort_handle=None):
         """Copy data to the specified table.
 
         :param str table_name:
@@ -974,6 +1034,33 @@ class Connection(metaclass=ConnectionMeta):
         :param float timeout:
             Optional timeout value in seconds.
 
+        :param progress_callback:
+            An optional callable that is invoked with a
+            :class:`~asyncpg.types.CopyProgress` instance as data is
+            sent.  The callable may be a regular function or a
+            coroutine function.  If it raises an exception, the COPY
+            operation is aborted via the COPY failure protocol and the
+            exception is propagated to the caller.
+
+        :param float progress_interval:
+            Minimum number of seconds between *progress_callback*
+            invocations.
+
+        :param int progress_interval_bytes:
+            Minimum number of payload bytes between
+            *progress_callback* invocations.
+
+        :param int chunk_size:
+            If specified, no single CopyData message will contain more
+            than *chunk_size* payload bytes; larger chunks are split
+            before being written to the transport.
+
+        :param abort_handle:
+            An optional :class:`~asyncpg.types.CopyAbortHandle`; its
+            :meth:`~asyncpg.types.CopyAbortHandle.abort` method can be
+            called to abort the COPY operation at any time.  Data
+            already sent is discarded by the server.
+
         The remaining keyword arguments are ``COPY`` statement options,
         see `COPY statement documentation`_ for details.
 
@@ -1001,7 +1088,20 @@ class Connection(metaclass=ConnectionMeta):
 
         .. versionadded:: 0.29.0
             Added the *where* parameter.
+
+        .. versionadded:: 0.32.0
+            Added the *progress_callback*, *progress_interval*,
+            *progress_interval_bytes*, *chunk_size* and *abort_handle*
+            parameters.
         """
+        _validate_copy_progress_options(
+            chunk_size=chunk_size,
+            progress_callback=progress_callback,
+            progress_interval=progress_interval,
+            progress_interval_bytes=progress_interval_bytes,
+            abort_handle=abort_handle,
+        )
+
         tabname = utils._quote_ident(table_name)
         if schema_name:
             tabname = utils._quote_ident(schema_name) + '.' + tabname
@@ -1023,11 +1123,21 @@ class Connection(metaclass=ConnectionMeta):
         copy_stmt = 'COPY {tab}{cols} FROM STDIN {opts} {cond}'.format(
             tab=tabname, cols=cols, opts=opts, cond=cond)
 
-        return await self._copy_in(copy_stmt, source, timeout)
+        return await self._copy_in(
+            copy_stmt, source, timeout,
+            progress_callback=progress_callback,
+            progress_interval=progress_interval,
+            progress_interval_bytes=progress_interval_bytes,
+            chunk_size=chunk_size,
+            abort_handle=abort_handle)
 
     async def copy_records_to_table(self, table_name, *, records,
                                     columns=None, schema_name=None,
-                                    timeout=None, where=None):
+                                    timeout=None, where=None,
+                                    progress_callback=None,
+                                    progress_interval=None,
+                                    progress_interval_bytes=None,
+                                    chunk_size=None, abort_handle=None):
         """Copy a list of records to the specified table using binary COPY.
 
         :param str table_name:
@@ -1056,6 +1166,33 @@ class Connection(metaclass=ConnectionMeta):
 
         :param float timeout:
             Optional timeout value in seconds.
+
+        :param progress_callback:
+            An optional callable that is invoked with a
+            :class:`~asyncpg.types.CopyProgress` instance as records
+            are sent.  The callable may be a regular function or a
+            coroutine function.  If it raises an exception, the COPY
+            operation is aborted via the COPY failure protocol and the
+            exception is propagated to the caller.
+
+        :param float progress_interval:
+            Minimum number of seconds between *progress_callback*
+            invocations.
+
+        :param int progress_interval_bytes:
+            Minimum number of payload bytes between
+            *progress_callback* invocations.
+
+        :param int chunk_size:
+            If specified, no single CopyData message will contain more
+            than *chunk_size* payload bytes; larger buffers are split
+            before being written to the transport.
+
+        :param abort_handle:
+            An optional :class:`~asyncpg.types.CopyAbortHandle`; its
+            :meth:`~asyncpg.types.CopyAbortHandle.abort` method can be
+            called to abort the COPY operation at any time.  Data
+            already sent is discarded by the server.
 
         :return: The status string of the COPY command.
 
@@ -1101,7 +1238,20 @@ class Connection(metaclass=ConnectionMeta):
 
         .. versionadded:: 0.29.0
             Added the *where* parameter.
+
+        .. versionadded:: 0.32.0
+            Added the *progress_callback*, *progress_interval*,
+            *progress_interval_bytes*, *chunk_size* and *abort_handle*
+            parameters.
         """
+        _validate_copy_progress_options(
+            chunk_size=chunk_size,
+            progress_callback=progress_callback,
+            progress_interval=progress_interval,
+            progress_interval_bytes=progress_interval_bytes,
+            abort_handle=abort_handle,
+        )
+
         tabname = utils._quote_ident(table_name)
         if schema_name:
             tabname = utils._quote_ident(schema_name) + '.' + tabname
@@ -1125,7 +1275,16 @@ class Connection(metaclass=ConnectionMeta):
             tab=tabname, cols=cols, opts=opts, cond=cond)
 
         return await self._protocol.copy_in(
-            copy_stmt, None, None, records, intro_ps._state, timeout)
+            copy_stmt, None, None, records, intro_ps._state, timeout,
+            chunk_size=chunk_size if chunk_size is not None else -1,
+            progress_callback=progress_callback,
+            progress_interval=(
+                float(progress_interval)
+                if progress_interval is not None else 0.0),
+            progress_interval_bytes=(
+                progress_interval_bytes
+                if progress_interval_bytes is not None else 0),
+            abort_handle=abort_handle)
 
     def _format_copy_where(self, where):
         if where and not self._server_caps.sql_copy_from_where:
@@ -1207,7 +1366,10 @@ class Connection(metaclass=ConnectionMeta):
             if opened_by_us:
                 f.close()
 
-    async def _copy_in(self, copy_stmt, source, timeout):
+    async def _copy_in(self, copy_stmt, source, timeout, *,
+                       progress_callback=None, progress_interval=None,
+                       progress_interval_bytes=None, chunk_size=None,
+                       abort_handle=None):
         try:
             path = os.fspath(source)
         except TypeError:
@@ -1254,7 +1416,16 @@ class Connection(metaclass=ConnectionMeta):
 
         try:
             return await self._protocol.copy_in(
-                copy_stmt, reader, data, None, None, timeout)
+                copy_stmt, reader, data, None, None, timeout,
+                chunk_size=chunk_size if chunk_size is not None else -1,
+                progress_callback=progress_callback,
+                progress_interval=(
+                    float(progress_interval)
+                    if progress_interval is not None else 0.0),
+                progress_interval_bytes=(
+                    progress_interval_bytes
+                    if progress_interval_bytes is not None else 0),
+                abort_handle=abort_handle)
         finally:
             if opened_by_us:
                 await run_in_executor(None, f.close)

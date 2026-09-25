@@ -51,6 +51,8 @@ cdef class BaseProtocol(CoreProtocol):
 
         bint _is_ssl
 
+        bint _copy_settled
+
         PreparedStatementState statement
 
     cdef get_connection(self)
@@ -59,6 +61,7 @@ cdef class BaseProtocol(CoreProtocol):
     cdef _check_state(self)
     cdef _new_waiter(self, timeout)
     cdef _coreproto_error(self)
+    cdef _copy_fail(self, str cause, bint cancel)
 
     cdef _on_result__connect(self, object waiter)
     cdef _on_result__prepare(self, object waiter)
