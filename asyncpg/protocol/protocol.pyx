@@ -562,7 +562,13 @@ cdef class BaseProtocol(CoreProtocol):
 
         return status_msg
 
-    async def close_statement(self, PreparedStatementState state, timeout):
+    async def close_statement(
+        self,
+        PreparedStatementState state,
+        timeout,
+        *,
+        bint force=False,
+    ):
         if self.cancel_waiter is not None:
             await self.cancel_waiter
         if self.cancel_sent_waiter is not None:
@@ -571,7 +577,7 @@ cdef class BaseProtocol(CoreProtocol):
 
         self._check_state()
 
-        if state.refs != 0:
+        if state.refs != 0 and not force:
             raise apg_exc.InternalClientError(
                 'cannot close prepared statement; refs == {} != 0'.format(
                     state.refs))
@@ -581,11 +587,29 @@ cdef class BaseProtocol(CoreProtocol):
         try:
             self._close(state.name, False)  # network op
             state.closed = True
+            state.close_sent = True
         except Exception as ex:
             waiter.set_exception(ex)
             self._coreproto_error()
         finally:
             return await waiter
+
+    def is_busy(self):
+        # Return True if a command (a query, COPY, batch, ...) is
+        # currently in flight on this connection.  Used to reject
+        # lifecycle operations (e.g. closing a prepared statement)
+        # that would interleave protocol messages incorrectly.
+        #
+        # Checking `state` in addition to `waiter` is necessary because
+        # a COPY operation keeps running while its per-chunk waiter is
+        # completed but the next one has not been created yet.
+        return (
+            self.state != PROTOCOL_IDLE
+            or self.waiter is not None
+            or self.timeout_handle is not None
+            or self.cancel_waiter is not None
+            or self.cancel_sent_waiter is not None
+        )
 
     def is_closed(self):
         return self.closing

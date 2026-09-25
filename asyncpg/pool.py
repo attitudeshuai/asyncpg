@@ -332,7 +332,10 @@ class Pool:
     Connection pool can be used to manage a set of connections to the database.
     Connections are first acquired from the pool, then used, and then released
     back to the pool.  Once a connection is released, it's reset to close all
-    open cursors and other resources *except* prepared statements.
+    open cursors and other resources, including *manually* prepared statements
+    (those created by :meth:`Connection.prepare()
+    <asyncpg.connection.Connection.prepare>`); the automatic prepared
+    statement cache is preserved across releases.
 
     Pools are created by calling :func:`~asyncpg.pool.create_pool`.
     """

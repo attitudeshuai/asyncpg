@@ -61,6 +61,16 @@ a need to run the same query again.
 
 .. autoclass:: asyncpg.prepared_stmt.PreparedStatement()
    :members:
+   :special-members: __aenter__, __aexit__
+
+   .. note::
+
+      Prepared statements support the asynchronous context manager protocol,
+      so the statement is closed automatically (see :meth:`close`) on both
+      normal and exceptional exit of the ``async with`` block::
+
+          async with await connection.prepare('SELECT 1') as stmt:
+              await stmt.fetchval()
 
 
 .. _asyncpg-api-transaction:

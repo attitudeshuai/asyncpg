@@ -10,6 +10,10 @@ cdef class PreparedStatementState:
         readonly str name
         readonly str query
         readonly bint closed
+        # Set to True once a Close message for this statement has been
+        # written to the wire, so that the same statement is never closed
+        # twice (unlike `closed`, which may be set before the close is sent).
+        readonly bint close_sent
         readonly bint prepared
         readonly int refs
         readonly type record_class

@@ -123,6 +123,7 @@ class BaseCursor(connresource.ConnectionResource):
                 'cursor already has an open portal')
 
         con = self._connection
+        con._touch_manual_stmt(self._state)
         protocol = con._protocol
 
         self._portal_name = con._get_unique_id('portal')
@@ -138,6 +139,7 @@ class BaseCursor(connresource.ConnectionResource):
                 'cursor already has an open portal')
 
         con = self._connection
+        con._touch_manual_stmt(self._state)
         protocol = con._protocol
 
         self._portal_name = con._get_unique_id('portal')
@@ -153,7 +155,9 @@ class BaseCursor(connresource.ConnectionResource):
             raise exceptions.InterfaceError(
                 'cursor does not have an open portal')
 
-        protocol = self._connection._protocol
+        con = self._connection
+        con._touch_manual_stmt(self._state)
+        protocol = con._protocol
         buffer, _, self._exhausted = await protocol.execute(
             self._state, self._portal_name, n, True, timeout)
         return buffer

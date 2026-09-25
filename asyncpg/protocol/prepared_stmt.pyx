@@ -27,6 +27,7 @@ cdef class PreparedStatementState:
         self.args_num = self.cols_num = 0
         self.cols_desc = None
         self.closed = False
+        self.close_sent = False
         self.prepared = True
         self.refs = 0
         self.record_class = record_class

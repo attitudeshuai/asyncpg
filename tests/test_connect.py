@@ -1650,10 +1650,17 @@ gsslib=sspi
 
         for arg in {'max_cacheable_statement_size',
                     'max_cached_statement_lifetime',
-                    'statement_cache_size'}:
+                    'statement_cache_size',
+                    'max_prepared_statements'}:
             for val in {None, -1, True, False}:
                 with self.assertRaisesRegex(ValueError, 'greater or equal'):
                     await asyncpg.connect(**{arg: val})
+
+        # A non-numeric value fails type validation; floats are rejected
+        # by Connection.set_max_prepared_statements() at runtime.
+        with self.assertRaises(TypeError):
+            await asyncpg.connect(
+                host='127.0.0.1', max_prepared_statements='a')
 
 
 class TestConnection(tb.ConnectedTestCase):

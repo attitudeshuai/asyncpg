@@ -625,3 +625,379 @@ class TestPrepare(tb.ConnectedTestCase):
             self.assertEqual(result, [(1, 'a'), (2, 'b'), (3, 'c')])
         finally:
             await tr.rollback()
+
+
+class TestPreparedStatementClose(tb.ConnectedTestCase):
+
+    async def _server_has_stmt(self, name):
+        return await self.con.fetchval(
+            "SELECT count(*) FROM pg_prepared_statements WHERE name = $1",
+            name)
+
+    async def test_prepare_close_01_immediate_release(self):
+        st = await self.con.prepare('SELECT 1')
+        name = st.get_name()
+        self.assertEqual(await self._server_has_stmt(name), 1)
+
+        await st.close()
+
+        # The server-side resource is released *immediately*, rather
+        # than being scheduled for closing on the next prepare().
+        self.assertEqual(await self._server_has_stmt(name), 0)
+        self.assertNotIn(st._state, self.con._stmts_to_close)
+        self.assertTrue(st.is_closed())
+
+    async def test_prepare_close_02_idempotent_and_isolated(self):
+        st1 = await self.con.prepare('SELECT 1')
+        st2 = await self.con.prepare('SELECT 2')
+
+        await st1.close()
+        await st1.close()  # must not raise
+        await st1.close()
+
+        # Other statements on the same connection are unaffected.
+        self.assertEqual(await st2.fetchval(), 2)
+        await st2.close()
+
+    async def test_prepare_close_03_use_after_close(self):
+        st = await self.con.prepare('SELECT $1::int')
+        await st.close()
+
+        for meth, args in (
+            ('fetch', ()),
+            ('fetchval', ()),
+            ('fetchrow', ()),
+            ('fetchmany', ([(1,)],)),
+            ('executemany', ([(1,)],)),
+            ('cursor', ()),
+            ('explain', ()),
+            ('get_parameters', ()),
+            ('get_attributes', ()),
+            ('get_query', ()),
+        ):
+            with self.subTest(meth=meth):
+                with self.assertRaisesRegex(
+                        asyncpg.InterfaceError, 'is closed'):
+                    await getattr(st, meth)(*args)
+
+    async def test_prepare_close_04_context_manager_normal_exit(self):
+        async with await self.con.prepare('SELECT 1') as st:
+            self.assertEqual(await st.fetchval(), 1)
+        self.assertTrue(st.is_closed())
+
+    async def test_prepare_close_05_context_manager_exception_exit(self):
+        with self.assertRaisesRegex(RuntimeError, 'boom'):
+            async with await self.con.prepare('SELECT 1') as st:
+                raise RuntimeError('boom')
+        self.assertTrue(st.is_closed())
+
+    async def test_prepare_close_06_in_transaction(self):
+        async with self.con.transaction():
+            st = await self.con.prepare('SELECT 1')
+            name = st.get_name()
+            self.assertEqual(await self._server_has_stmt(name), 1)
+            await st.close()
+            self.assertEqual(await self._server_has_stmt(name), 0)
+            # The transaction is still usable after the close.
+            self.assertEqual(await self.con.fetchval('SELECT 1'), 1)
+
+    async def test_prepare_close_07_during_query(self):
+        st = await self.con.prepare('SELECT 1')
+
+        task = self.loop.create_task(
+            self.con.execute('SELECT pg_sleep(1)'))
+        await asyncio.sleep(0.1)
+
+        with self.assertRaisesRegex(
+                asyncpg.InterfaceError, 'another operation is in progress'):
+            await st.close()
+
+        # The rejected close must not touch the statement.
+        self.assertFalse(st.is_closed())
+        await task
+        self.assertEqual(await st.fetchval(), 1)
+        await st.close()
+
+    async def test_prepare_close_08_during_copy(self):
+        st = await self.con.prepare('SELECT 1')
+
+        async def sink(_data):
+            pass
+
+        task = self.loop.create_task(self.con.copy_from_query(
+            'SELECT pg_sleep(1)', output=sink))
+        await asyncio.sleep(0.2)
+
+        with self.assertRaisesRegex(
+                asyncpg.InterfaceError, 'another operation is in progress'):
+            await st.close()
+
+        self.assertFalse(st.is_closed())
+        await task
+        self.assertEqual(await st.fetchval(), 1)
+        await st.close()
+
+    async def test_prepare_close_09_live_cursor_defers_server_close(self):
+        st = await self.con.prepare('SELECT 1')
+        name = st.get_name()
+        cursor_factory = st.cursor()  # keeps a reference on the state
+
+        await st.close()
+        self.assertTrue(st.is_closed())
+        # A cursor handle is still alive, so the server-side statement
+        # is kept until the last handle goes away.
+        self.assertEqual(await self._server_has_stmt(name), 1)
+
+        del cursor_factory
+        gc.collect()
+
+        # Creating a new statement flushes the deferred close.
+        other = await self.con.prepare('SELECT 2')
+        self.assertEqual(await self._server_has_stmt(name), 0)
+        await other.close()
+
+    async def test_prepare_close_10_after_connection_close(self):
+        st = await self.con.prepare('SELECT 1')
+        await self.con.close()
+        # No-op on a dead connection; must not raise.
+        await st.close()
+        await st.close()
+
+    @tb.with_connection_options(statement_cache_size=0)
+    async def test_prepare_close_11_anonymous_statement(self):
+        # With the statement cache disabled, manually prepared statements
+        # are anonymous and are not tracked server-side; close() still
+        # invalidates the client-side handle.
+        st = await self.con.prepare('SELECT 1')
+        self.assertEqual(st.get_name(), '')
+        self.assertEqual(len(self.con._manual_stmts), 0)
+        await st.close()
+        with self.assertRaisesRegex(
+                asyncpg.InterfaceError, 'is closed'):
+            await st.fetchval()
+
+
+class TestPreparedStatementLimit(tb.ConnectedTestCase):
+
+    @tb.with_connection_options(max_prepared_statements=2)
+    async def test_prepare_limit_01_getter(self):
+        self.assertEqual(self.con.get_max_prepared_statements(), 2)
+
+    async def test_prepare_limit_02_setter_validation(self):
+        self.assertEqual(self.con.get_max_prepared_statements(), 0)
+
+        for bad in (-1, True, False, None, '1', 1.5):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    self.con.set_max_prepared_statements(bad)
+
+        self.con.set_max_prepared_statements(3)
+        self.assertEqual(self.con.get_max_prepared_statements(), 3)
+        self.con.set_max_prepared_statements(0)
+        self.assertEqual(self.con.get_max_prepared_statements(), 0)
+
+    async def test_prepare_limit_03_default_is_unlimited(self):
+        stmts = [
+            await self.con.prepare('SELECT {}'.format(i)) for i in range(10)
+        ]
+        self.assertEqual(len(self.con._manual_stmts), 10)
+        for st in stmts:
+            await st.close()
+
+    @tb.with_connection_options(max_prepared_statements=2)
+    async def test_prepare_limit_04_pinned_overflow_raises(self):
+        s1 = await self.con.prepare('SELECT 1')
+        s2 = await self.con.prepare('SELECT 2')
+        self.assertEqual(len(self.con._manual_stmts), 2)
+
+        with self.assertRaisesRegex(
+                asyncpg.InterfaceError,
+                'maximum number of manually prepared statements'):
+            await self.con.prepare('SELECT 3')
+
+        # The failed prepare must not leave a server-side statement
+        # behind or grow the registry.
+        self.assertEqual(len(self.con._manual_stmts), 2)
+        self.assertEqual(await s1.fetchval(), 1)
+        self.assertEqual(await s2.fetchval(), 2)
+
+    @tb.with_connection_options(max_prepared_statements=2)
+    async def test_prepare_limit_05_lru_eviction(self):
+        s_old = await self.con.prepare('SELECT 1')
+        await s_old.fetchval()
+        s_new = await self.con.prepare('SELECT 2')
+        old_name = s_old.get_name()
+        new_name = s_new.get_name()
+
+        del s_old
+        gc.collect()
+
+        with self.assertLogs('asyncpg.connection', level='INFO') as cm:
+            s_extra = await self.con.prepare('SELECT 3')
+
+        self.assertTrue(
+            any('prepared statement' in line for line in cm.output))
+
+        # The oldest unreferenced statement is gone from the server and
+        # from the registry; referenced statements are kept.
+        self.assertEqual(
+            await self.con.fetchval(
+                "SELECT count(*) FROM pg_prepared_statements WHERE name = $1",
+                old_name),
+            0)
+        self.assertEqual(
+            await self.con.fetchval(
+                "SELECT count(*) FROM pg_prepared_statements WHERE name = $1",
+                new_name),
+            1)
+        self.assertEqual(await s_new.fetchval(), 2)
+        self.assertEqual(await s_extra.fetchval(), 3)
+        self.assertEqual(len(self.con._manual_stmts), 2)
+
+    @tb.with_connection_options(max_prepared_statements=2)
+    async def test_prepare_limit_06_lru_order_on_use(self):
+        s_old = await self.con.prepare('SELECT 1')
+        s_new = await self.con.prepare('SELECT 2')
+        old_name = s_old.get_name()
+        new_name = s_new.get_name()
+
+        # Promote the older statement, so the other one is now LRU.
+        await s_old.fetchval()
+
+        del s_new
+        gc.collect()
+
+        await self.con.prepare('SELECT 3')
+
+        self.assertEqual(
+            await self.con.fetchval(
+                "SELECT count(*) FROM pg_prepared_statements WHERE name = $1",
+                new_name),
+            0)
+        self.assertEqual(
+            await self.con.fetchval(
+                "SELECT count(*) FROM pg_prepared_statements WHERE name = $1",
+                old_name),
+            1)
+
+    @tb.with_connection_options(max_prepared_statements=2)
+    async def test_prepare_limit_07_statement_with_cursor_is_pinned(self):
+        s_with_cursor = await self.con.prepare('SELECT 1')
+        cursor_factory = s_with_cursor.cursor()
+        other = await self.con.prepare('SELECT 2')
+
+        del s_with_cursor
+        gc.collect()
+
+        # The cursor factory keeps the statement referenced, so the
+        # limit cannot be enforced by evicting it.
+        with self.assertRaisesRegex(
+                asyncpg.InterfaceError,
+                'still in use'):
+            await self.con.prepare('SELECT 3')
+
+        del cursor_factory
+        del other
+        gc.collect()
+
+        # Once unreferenced, a new statement can be created.
+        s_final = await self.con.prepare('SELECT 4')
+        self.assertEqual(await s_final.fetchval(), 4)
+
+    @tb.with_connection_options(max_prepared_statements=1)
+    async def test_prepare_limit_08_independent_from_stmt_cache(self):
+        st = await self.con.prepare('SELECT 1')
+
+        # Fill the automatic cache well beyond the manual-statement
+        # limit; manual statements must not be evicted by the cache.
+        for i in range(150):
+            await self.con.fetchval('SELECT {}'.format(i))
+
+        self.assertEqual(len(self.con._manual_stmts), 1)
+        self.assertEqual(await st.fetchval(), 1)
+
+        cache_size_before = len(self.con._stmt_cache)
+        del st
+        gc.collect()
+        await self.con.prepare('SELECT 2')
+
+        # Manual-statement eviction must not touch the automatic cache.
+        self.assertEqual(len(self.con._stmt_cache), cache_size_before)
+
+    async def test_prepare_limit_09_set_limit_at_runtime(self):
+        stmts = [await self.con.prepare('SELECT {}'.format(i))
+                 for i in range(3)]
+        self.assertEqual(len(self.con._manual_stmts), 3)
+
+        self.con.set_max_prepared_statements(2)
+        # Referenced statements cannot be evicted from under the user.
+        self.assertEqual(len(self.con._manual_stmts), 3)
+        with self.assertRaisesRegex(
+                asyncpg.InterfaceError, 'still in use'):
+            await self.con.prepare('SELECT 100')
+
+        del stmts[0]
+        del stmts[1]
+        gc.collect()
+        # Two statements are still referenced; evicting the dead one
+        # makes room for exactly one more.
+        await self.con.prepare('SELECT 100')
+        self.assertEqual(len(self.con._manual_stmts), 2)
+
+
+class TestPreparedStatementPool(tb.ClusterTestCase):
+
+    async def test_pool_manual_stmts_cleaned_on_release(self):
+        pool = await self.create_pool(
+            database='postgres', min_size=1, max_size=1)
+
+        stale = None
+        stale_name = None
+        async with pool.acquire() as con:
+            stale = await con.prepare('SELECT 1')
+            stale_name = stale.get_name()
+            self.assertEqual(await con.fetchval(
+                "SELECT count(*) FROM pg_prepared_statements WHERE name = $1",
+                stale_name), 1)
+
+            # The automatic cache survives pool release; use it so there
+            # is an entry to check on the next checkout.
+            await con.fetchval('SELECT 999')
+            cached_count = len(con._con._stmt_cache)
+            self.assertGreater(cached_count, 0)
+
+        async with pool.acquire() as con:
+            # Previous owner's manual statement is gone from the server.
+            self.assertEqual(await con.fetchval(
+                "SELECT count(*) FROM pg_prepared_statements WHERE name = $1",
+                stale_name), 0)
+            # ...while automatic cached statements survive.
+            self.assertEqual(
+                len(con._con._stmt_cache), cached_count)
+            # No name conflict: preparing and running the same query
+            # works for the next owner.
+            self.assertEqual(
+                await (await con.prepare('SELECT 1')).fetchval(), 1)
+
+        with self.assertRaisesRegex(
+                asyncpg.InterfaceError, 'released back to the pool'):
+            await stale.fetchval()
+
+        await pool.close()
+
+    async def test_pool_manual_stmt_limit_option(self):
+        pool = await self.create_pool(
+            database='postgres', min_size=1, max_size=1,
+            max_prepared_statements=1)
+        try:
+            async with pool.acquire() as con:
+                self.assertEqual(
+                    con._con.get_max_prepared_statements(), 1)
+                held = await con.prepare('SELECT 1')
+                with self.assertRaisesRegex(
+                        asyncpg.InterfaceError,
+                        'manually prepared statements'):
+                    await con.prepare('SELECT 2')
+                self.assertEqual(await held.fetchval(), 1)
+        finally:
+            await pool.close()

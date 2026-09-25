@@ -13,6 +13,7 @@ import contextlib
 import functools
 import itertools
 import inspect
+import logging
 import os
 import sys
 import time
@@ -33,6 +34,9 @@ from . import transaction
 from . import utils
 
 
+logger = logging.getLogger(__name__)
+
+
 class ConnectionMeta(type):
 
     def __instancecheck__(cls, instance):
@@ -50,6 +54,7 @@ class Connection(metaclass=ConnectionMeta):
                  '_top_xact', '_aborted',
                  '_pool_release_ctr', '_stmt_cache', '_stmts_to_close',
                  '_stmt_cache_enabled',
+                 '_manual_stmts', '_max_prepared_statements',
                  '_listeners', '_server_version', '_server_caps',
                  '_intro_query', '_reset_query', '_proxy',
                  '_stmt_exclusive_section', '_config', '_params', '_addr',
@@ -83,6 +88,20 @@ class Connection(metaclass=ConnectionMeta):
 
         self._stmts_to_close = set()
         self._stmt_cache_enabled = config.statement_cache_size > 0
+
+        # Registry of *manually* created prepared statements (i.e. those
+        # returned by Connection.prepare()).  It is completely separate
+        # from `_stmt_cache` (the automatic LRU cache used by
+        # fetch()/execute()/...): neither set ever evicts the other.
+        #
+        # The OrderedDict maps the low-level PreparedStatementState to a
+        # weak reference of the high-level PreparedStatement wrapper and
+        # doubles as an LRU list (new/used statements are moved to the
+        # end).  Liveness is decided via `state.refs` (a dead wrapper and
+        # any dead cursors detach from the state), which also makes
+        # garbage-collected entries eviction candidates.
+        self._manual_stmts = collections.OrderedDict()
+        self._max_prepared_statements = config.max_prepared_statements
 
         self._listeners = {}
         self._log_listeners = set()
@@ -640,6 +659,7 @@ class Connection(metaclass=ConnectionMeta):
             name=name,
             timeout=timeout,
             record_class=record_class,
+            register=True,
         )
 
     async def _prepare(
@@ -649,11 +669,17 @@ class Connection(metaclass=ConnectionMeta):
         name: typing.Union[str, bool, None] = None,
         timeout=None,
         use_cache: bool=False,
-        record_class=None
+        record_class=None,
+        register: bool=False,
     ):
         self._check_open()
         if name is None:
             name = self._stmt_cache_enabled
+        if register and name:
+            # Raise *before* sending Parse if the limit is already taken
+            # up by statements that are still referenced, so that no
+            # server-side statement is left over from a failed prepare.
+            self._check_manual_stmt_capacity()
         stmt = await self._get_statement(
             query,
             timeout,
@@ -661,7 +687,52 @@ class Connection(metaclass=ConnectionMeta):
             use_cache=use_cache,
             record_class=record_class,
         )
-        return prepared_stmt.PreparedStatement(self, query, stmt)
+        pstmt = prepared_stmt.PreparedStatement(self, query, stmt)
+        if register:
+            self._register_manual_stmt(pstmt)
+            try:
+                await self._enforce_manual_stmt_limit()
+            except BaseException:
+                # Practically unreachable thanks to the pre-check above,
+                # but never leak the just-created server statement: drop
+                # the never-returned wrapper and close it immediately.
+                self._abandon_manual_stmt(pstmt)
+                raise
+        return pstmt
+
+    def _abandon_manual_stmt(self, pstmt):
+        state = pstmt._state
+        # Mark the never-returned wrapper as closed so that its __del__
+        # does not detach the state a second time.
+        pstmt._closed = True
+        self._manual_stmts.pop(state, None)
+        state.detach()
+        if not state.closed:
+            state.mark_closed()
+        if (
+            state.name
+            and not state.close_sent
+            and not self._aborted
+            and self._protocol is not None
+            and not self.is_closed()
+        ):
+            # Best-effort immediate close; failures terminate the
+            # connection through the protocol's own error handling.
+            self._stmts_to_close.add(state)
+
+    def _check_manual_stmt_capacity(self):
+        limit = self._max_prepared_statements
+        if not limit:
+            return
+        pinned = sum(
+            1 for state in self._manual_stmts if state.refs > 0
+        )
+        if pinned >= limit:
+            raise exceptions.InterfaceError(
+                'cannot create prepared statement: the maximum number of '
+                'manually prepared statements ({}) on this connection has '
+                'been reached, and all of them are still in use; close or '
+                'release some prepared statements first'.format(limit))
 
     async def fetch(
         self,
@@ -1116,7 +1187,7 @@ class Connection(metaclass=ConnectionMeta):
         intro_query = 'SELECT {cols} FROM {tab} LIMIT 1'.format(
             tab=tabname, cols=col_list)
 
-        intro_ps = await self.prepare(intro_query)
+        intro_ps = await self._prepare(intro_query)
 
         cond = self._format_copy_where(where)
         opts = '(FORMAT binary)'
@@ -1541,16 +1612,25 @@ class Connection(metaclass=ConnectionMeta):
             self._top_xact = None
             await self.execute("ROLLBACK")
 
+        # Explicitly close and release all manually created prepared
+        # statements so that the next acquirer of this connection (e.g.
+        # from a pool) cannot see the previous owner's statement names.
+        # The automatic statement cache is intentionally left intact.
+        await self._cleanup_manual_stmts()
+
     async def reset(self, *, timeout=None):
         """Reset the connection state.
 
         Calling this will reset the connection session state to a state
         resembling that of a newly obtained connection.  Namely, an open
         transaction (if any) is rolled back, open cursors are closed,
+        all *manually* prepared statements (those created by
+        :meth:`prepare`) are closed on the server,
         all `LISTEN <https://www.postgresql.org/docs/current/sql-listen.html>`_
         registrations are removed, all session configuration
         variables are reset to their default values, and all advisory locks
-        are released.
+        are released.  The automatic prepared statement cache is not
+        affected.
 
         Note that the above describes the default query returned by
         :meth:`Connection.get_reset_query`.  If one overloads the method
@@ -1616,8 +1696,12 @@ class Connection(metaclass=ConnectionMeta):
         for stmt in self._stmts_to_close:
             stmt.mark_closed()
 
+        for stmt in self._manual_stmts:
+            stmt.mark_closed()
+
         self._stmt_cache.clear()
         self._stmts_to_close.clear()
+        self._manual_stmts.clear()
 
     def _maybe_gc_stmt(self, stmt):
         if (
@@ -1634,9 +1718,28 @@ class Connection(metaclass=ConnectionMeta):
             #    for any `PreparedStatement` or for methods like
             #    `Connection.fetch()`.
             #
-            # * schedule it to be formally closed on the server.
+            #  * schedule it to be formally closed on the server.
             stmt.mark_closed()
-            self._stmts_to_close.add(stmt)
+            if stmt.close_sent:
+                # The Close message for this statement has already been
+                # written to the wire (e.g. by the manual-statement
+                # registry), do not close it twice.
+                self._manual_stmts.pop(stmt, None)
+                self._stmts_to_close.discard(stmt)
+            elif stmt in self._manual_stmts:
+                if self._max_prepared_statements:
+                    # The manual-statement registry owns the lifecycle of
+                    # this statement: it will be closed by LRU eviction on
+                    # the next prepare(), or when the connection is reset.
+                    pass
+                else:
+                    # No manual-statement limit is configured: fall back to
+                    # the historical deferred-close behaviour and drop the
+                    # registry entry.
+                    self._manual_stmts.pop(stmt, None)
+                    self._stmts_to_close.add(stmt)
+            else:
+                self._stmts_to_close.add(stmt)
 
     async def _cleanup_stmts(self):
         # Called whenever we create a new prepared statement in
@@ -1645,9 +1748,240 @@ class Connection(metaclass=ConnectionMeta):
         to_close = self._stmts_to_close
         self._stmts_to_close = set()
         for stmt in to_close:
+            if stmt.refs != 0:
+                # A cursor (or another high-level handle) still references
+                # this statement.  Keep it pending and close it once its
+                # last reference is gone.
+                self._stmts_to_close.add(stmt)
+                continue
             # It is imperative that statements are cleaned properly,
             # so we ignore the timeout.
             await self._protocol.close_statement(stmt, protocol.NO_TIMEOUT)
+
+    # ------------------------------------------------------------------
+    # Manual prepared-statement registry and resource governance.
+    # ------------------------------------------------------------------
+
+    def get_max_prepared_statements(self) -> int:
+        """Return the maximum number of manually prepared statements.
+
+        A value of ``0`` means that there is no limit.
+
+        .. versionadded:: 0.32.0
+        """
+        return self._max_prepared_statements
+
+    def set_max_prepared_statements(self, limit: int) -> None:
+        """Set the maximum number of manually prepared statements.
+
+        Manually prepared statements are those created explicitly by
+        :meth:`Connection.prepare() <asyncpg.connection.Connection.prepare>`.
+        The automatic statement cache (used by
+        :meth:`~asyncpg.connection.Connection.fetch` and similar methods)
+        is not affected by this limit and is accounted for separately.
+
+        When the limit is exceeded, statements that are no longer
+        referenced are closed on the server in least-recently-used order.
+        Statements that are still referenced (or are currently executing)
+        are never closed automatically.
+
+        :param int limit:
+            The new limit.  Pass ``0`` for no limit (the default).
+
+        .. versionadded:: 0.32.0
+        """
+        if (
+            limit is None
+            or isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or limit < 0
+        ):
+            raise ValueError(
+                'max_prepared_statements is expected to be a non-negative '
+                'integer, got {!r}'.format(limit))
+
+        self._max_prepared_statements = limit
+
+        if not limit:
+            # With the limit disabled, registry entries whose wrappers are
+            # gone must follow the historical deferred-close semantics.
+            dead = [
+                stmt for stmt in self._manual_stmts
+                if stmt.refs == 0
+            ]
+            for stmt in dead:
+                self._manual_stmts.pop(stmt, None)
+                if not stmt.closed:
+                    stmt.mark_closed()
+                if not stmt.close_sent:
+                    self._stmts_to_close.add(stmt)
+
+    def _register_manual_stmt(self, pstmt):
+        # Only named statements live on the server between operations;
+        # anonymous statements are re-parsed on every execution and do
+        # not consume any persistent server-side resources.
+        state = pstmt._state
+        if not state.name:
+            return
+
+        self._manual_stmts[state] = weakref.ref(pstmt)
+        self._manual_stmts.move_to_end(state)
+
+    def _unregister_manual_stmt(self, pstmt, state):
+        entry = self._manual_stmts.get(state)
+        if entry is not None and entry() is pstmt:
+            del self._manual_stmts[state]
+
+    def _touch_manual_stmt(self, state):
+        # Record that a manual statement has just been used, promoting it
+        # to the most-recently-used end of the LRU registry.
+        if state in self._manual_stmts:
+            self._manual_stmts.move_to_end(state)
+
+    async def _send_stmt_close(self, state, *, force=False):
+        # Send a Close message immediately.  The caller is responsible
+        # for marking the state as closed and for removing it from the
+        # registry / pending-close sets.
+        self._stmts_to_close.discard(state)
+        try:
+            await self._protocol.close_statement(
+                state, protocol.NO_TIMEOUT, force=force)
+        except (OSError, asyncio.CancelledError):
+            # The connection is unusable; terminate it instead of leaving
+            # a half-closed statement recorded on a live connection.
+            if not self.is_closed():
+                self.terminate()
+            raise
+        except exceptions.InterfaceError:
+            if self.is_closed():
+                return
+            # E.g. a cancellation is still settling: retry the close on
+            # the next statement instead of leaking it on the server.
+            self._stmts_to_close.add(state)
+            raise
+
+    async def _enforce_manual_stmt_limit(self):
+        # Close registry entries that are no longer referenced (their
+        # high-level PreparedStatement wrappers and any cursors are gone).
+        # They are closed in least-recently-used order; when a manual
+        # statement limit is configured the registry is trimmed down to
+        # it, otherwise the dead entries are merely flushed.
+        limit = self._max_prepared_statements
+
+        # `dead` is already in LRU (oldest-first) order, as the registry
+        # preserves insertion/usage order.
+        dead = [
+            state for state in self._manual_stmts
+            if state.refs == 0
+        ]
+
+        if limit:
+            excess = len(self._manual_stmts) - limit
+            to_close_count = min(len(dead), excess)
+        else:
+            # No limit: merely flush (close) all unreferenced entries,
+            # matching the historical garbage-collection timing.
+            to_close_count = len(dead)
+
+        to_close = dead[:to_close_count]
+
+        evicted = []
+        for state in to_close:
+            self._manual_stmts.pop(state, None)
+            if not state.closed:
+                state.mark_closed()
+            if state.close_sent:
+                continue
+            await self._send_stmt_close(state)
+            evicted.append(state.name)
+
+        if evicted and limit:
+            logger.info(
+                'closed %d unreferenced prepared statement(s) on %r to '
+                'enforce max_prepared_statements=%d: %s',
+                len(evicted), self, limit, ', '.join(evicted))
+        elif evicted:
+            logger.debug(
+                'closed %d unreferenced prepared statement(s) on %r: %s',
+                len(evicted), self, ', '.join(evicted))
+
+        if limit and len(self._manual_stmts) > limit:
+            # All remaining statements are still referenced (pinned).
+            raise exceptions.InterfaceError(
+                'cannot create prepared statement: the maximum number of '
+                'manually prepared statements ({}) on this connection has '
+                'been reached, and all of them are still in use; close or '
+                'release some prepared statements first'.format(limit))
+
+    async def _close_manual_stmt(self, pstmt):
+        # Called by PreparedStatement.close() after the wrapper has
+        # detached itself and marked the state closed.  Releases the
+        # server-side statement immediately whenever possible.
+        state = pstmt._state
+
+        if not state.name or state.close_sent:
+            self._stmts_to_close.discard(state)
+            return
+
+        if self._aborted or self._protocol is None or self.is_closed():
+            # The connection is gone (or going away): there is nothing
+            # to send, and `_cleanup()` has already (or will) mark every
+            # statement as closed.
+            return
+
+        if state.refs != 0:
+            # Cursors or other high-level handles derived from this
+            # statement are still alive.  The statement itself is marked
+            # closed (so the handles will fail explicitly), but its
+            # server-side resource can only be released once the last
+            # reference is gone; defer the Close message until then.
+            self._stmts_to_close.add(state)
+            return
+
+        await self._send_stmt_close(state)
+
+    async def _cleanup_manual_stmts(self):
+        # Close every still-registered manual statement on the server.
+        # Called when the connection is reset, which happens whenever it
+        # is released back to a pool.  Statement handles held by the
+        # previous owner become invalid via the pool-release counter.
+        entries = list(self._manual_stmts.items())
+        self._manual_stmts.clear()
+
+        if not entries:
+            # Still flush anything that was pending a deferred close, so
+            # that no stale server-side statements leak across users.
+            if self._stmts_to_close and not self.is_closed():
+                await self._cleanup_stmts()
+            return
+
+        if self._aborted or self._protocol is None or self.is_closed():
+            for state, _wr in entries:
+                state.mark_closed()
+            return
+
+        # Mark everything closed locally first so that a failure to close
+        # one statement never leaves an inconsistent registration behind.
+        for state, _wr in entries:
+            if not state.closed:
+                state.mark_closed()
+
+        try:
+            for state, _wr in entries:
+                if state.name and not state.close_sent:
+                    # `force` because the previous owner may still hold
+                    # PreparedStatement wrapper objects (and hence refs).
+                    await self._protocol.close_statement(
+                        state, protocol.NO_TIMEOUT, force=True)
+        except (OSError, asyncio.CancelledError):
+            # The connection is unusable; terminate it rather than leave
+            # the next pool user with stale server-side statements.
+            self.terminate()
+            raise
+
+        # Finally, flush anything that was pending a deferred close.
+        if self._stmts_to_close:
+            await self._cleanup_stmts()
 
     async def _cancel(self, waiter):
         try:
@@ -2091,6 +2425,7 @@ async def connect(dsn=None, *,
                   statement_cache_size=100,
                   max_cached_statement_lifetime=300,
                   max_cacheable_statement_size=1024 * 15,
+                  max_prepared_statements=0,
                   command_timeout=None,
                   ssl=None,
                   direct_tls=None,
@@ -2222,6 +2557,25 @@ async def connect(dsn=None, *,
         The maximum size of a statement that can be cached (15KiB by
         default).  Pass ``0`` to allow all statements to be cached
         regardless of their size.
+
+    :param int max_prepared_statements:
+        The maximum number of *manually* prepared statements (i.e. those
+        created by :meth:`Connection.prepare()
+        <asyncpg.connection.Connection.prepare>`) that may exist on this
+        connection at the same time.  When the limit is exceeded,
+        statements that are no longer referenced are closed on the
+        server in least-recently-used order.  Statements still referenced
+        (or currently executing) are never closed automatically; if all
+        existing manual statements are still in use when the limit is
+        reached, :meth:`~asyncpg.connection.Connection.prepare` raises an
+        :exc:`~asyncpg.exceptions.InterfaceError`.  The automatic
+        statement cache is accounted for separately and is not affected
+        by this limit.  Pass ``0`` (the default) for no limit.  The limit
+        can also be queried or changed at runtime with
+        :meth:`Connection.get_max_prepared_statements()
+        <asyncpg.connection.Connection.get_max_prepared_statements>` and
+        :meth:`Connection.set_max_prepared_statements()
+        <asyncpg.connection.Connection.set_max_prepared_statements>`.
 
     :param float command_timeout:
         The default timeout for operations on this connection
@@ -2460,6 +2814,7 @@ async def connect(dsn=None, *,
             statement_cache_size=statement_cache_size,
             max_cached_statement_lifetime=max_cached_statement_lifetime,
             max_cacheable_statement_size=max_cacheable_statement_size,
+            max_prepared_statements=max_prepared_statements,
             target_session_attrs=target_session_attrs,
             krbsrvname=krbsrvname,
             gsslib=gsslib,
