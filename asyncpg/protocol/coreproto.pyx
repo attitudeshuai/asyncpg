@@ -171,6 +171,7 @@ cdef class CoreProtocol:
                 # is usually either malformed authentication data
                 # or missing support for cryptographic primitives
                 # in the hashlib module.
+                self.scram = None
                 self.result_type = RESULT_FAILED
                 self.result = apg_exc.InternalClientError(
                     f"unexpected error while performing authentication: {ex}")
@@ -179,6 +180,9 @@ cdef class CoreProtocol:
                 self._push_result()
             else:
                 if self.result_type != RESULT_OK:
+                    # Do not leave a half-finished SCRAM exchange on a
+                    # connection that has failed authentication.
+                    self.scram = None
                     self.con_status = CONNECTION_BAD
                     self._push_result()
 
@@ -193,6 +197,7 @@ cdef class CoreProtocol:
 
         elif mtype == b'E':
             # ErrorResponse
+            self.scram = None
             self.con_status = CONNECTION_BAD
             self._parse_msg_error_response(True)
             self._push_result()
@@ -566,8 +571,9 @@ cdef class CoreProtocol:
         cdef:
             int32_t status
             bytes md5_salt
-            list sasl_auth_methods
-            list unsupported_sasl_auth_methods
+            list advertised_sasl_auth_methods
+            bytes auth_method
+            tuple selected_sasl_auth
 
         status = self.buffer.read_int32()
 
@@ -577,46 +583,52 @@ cdef class CoreProtocol:
 
         elif status == AUTH_REQUIRED_PASSWORD:
             # AuthenticationCleartextPassword
-            self.result_type = RESULT_OK
-            self.auth_msg = self._auth_password_message_cleartext()
+            if self._channel_binding_is_required():
+                self.result_type = RESULT_FAILED
+                self.result = apg_exc.InterfaceError(
+                    'SCRAM channel binding is required, but the server '
+                    'requested cleartext password authentication, which '
+                    'does not support channel binding')
+            else:
+                self.result_type = RESULT_OK
+                self.auth_msg = self._auth_password_message_cleartext()
 
         elif status == AUTH_REQUIRED_PASSWORDMD5:
             # AuthenticationMD5Password
             # Note: MD5 salt is passed as a four-byte sequence
             md5_salt = self.buffer.read_bytes(4)
-            self.auth_msg = self._auth_password_message_md5(md5_salt)
+            if self._channel_binding_is_required():
+                self.result_type = RESULT_FAILED
+                self.result = apg_exc.InterfaceError(
+                    'SCRAM channel binding is required, but the server '
+                    'requested MD5 password authentication, which does '
+                    'not support channel binding')
+            else:
+                self.auth_msg = self._auth_password_message_md5(md5_salt)
 
         elif status == AUTH_REQUIRED_SASL:
             # AuthenticationSASL
             # This requires making additional requests to the server in order
             # to follow the SCRAM protocol defined in RFC 5802.
-            # get the SASL authentication methods that the server is providing
-            sasl_auth_methods = []
-            unsupported_sasl_auth_methods = []
-            # determine if the advertised authentication methods are supported,
-            # and if so, add them to the list
+            # Collect the SASL authentication mechanisms that the server
+            # is actually advertising, in the server's preference order.
+            advertised_sasl_auth_methods = []
             auth_method = self.buffer.read_null_str()
             while auth_method:
-                if auth_method in SCRAMAuthentication.AUTHENTICATION_METHODS:
-                    sasl_auth_methods.append(auth_method)
-                else:
-                    unsupported_sasl_auth_methods.append(auth_method)
+                advertised_sasl_auth_methods.append(auth_method)
                 auth_method = self.buffer.read_null_str()
 
-            # if none of the advertised authentication methods are supported,
-            # raise an error
-            # otherwise, initialize the SASL authentication exchange
-            if not sasl_auth_methods:
-                unsupported_sasl_auth_methods = [m.decode("ascii")
-                    for m in unsupported_sasl_auth_methods]
-                self.result_type = RESULT_FAILED
-                self.result = apg_exc.InterfaceError(
-                    'unsupported SASL Authentication methods requested by the '
-                    'server: {!r}'.format(
-                        ", ".join(unsupported_sasl_auth_methods)))
-            else:
+            # Select the mechanism according to the channel binding
+            # policy and the TLS state of this connection.  On failure
+            # _select_sasl_mechanism() populates self.result with an
+            # error explaining why channel binding could not be used.
+            selected_sasl_auth = self._select_sasl_mechanism(
+                advertised_sasl_auth_methods)
+            if selected_sasl_auth is not None:
                 self.auth_msg = self._auth_password_message_sasl_initial(
-                    sasl_auth_methods)
+                    selected_sasl_auth[0],
+                    selected_sasl_auth[1],
+                    selected_sasl_auth[2])
 
         elif status == AUTH_SASL_CONTINUE:
             # AUTH_SASL_CONTINUE
@@ -694,12 +706,123 @@ cdef class CoreProtocol:
 
         return msg
 
-    cdef _auth_password_message_sasl_initial(self, list sasl_auth_methods):
+    cdef bint _channel_binding_is_required(self):
+        return self.con_params.channel_binding == 'require'
+
+    cdef bytes _get_tls_peer_certificate(self):
+        """Return the DER-encoded TLS server certificate, or None.
+
+        None means that the connection is not TLS-encrypted (or that the
+        transport does not expose a certificate, in which case channel
+        binding is likewise unavailable).
+        """
+        cdef:
+            object ssl_object
+
+        if self.transport is None:
+            return None
+
+        ssl_object = self.transport.get_extra_info('ssl_object')
+        if ssl_object is None:
+            return None
+
+        # binary_form=True returns the DER certificate regardless of
+        # whether certificate verification was requested.
+        return ssl_object.getpeercert(True)
+
+    cdef _select_sasl_mechanism(self, list advertised):
+        """Pick a SASL mechanism based on the advertised list and policy.
+
+        Returns a (mechanism, channel_binding_data, supports_channel_binding)
+        tuple on success, or None after populating self.result with an
+        explanatory error.  The semantics mirror libpq's pg_SASL_init():
+
+        * SCRAM-SHA-256-PLUS is only usable on an encrypted connection
+          and when channel binding is not disabled;
+        * "require" fails if the connection is not encrypted or the
+          server does not offer a channel-binding mechanism;
+        * a SCRAM-SHA-256-PLUS offer over a non-encrypted connection
+          is always rejected rather than silently downgraded.
+        """
+        cdef:
+            object policy
+            bytes cert_der
+            bytes channel_binding_data
+            bint encrypted
+            bint plus_offered
+            bint plain_offered
+            bint supports_channel_binding
+
+        policy = self.con_params.channel_binding
+        cert_der = self._get_tls_peer_certificate()
+        encrypted = cert_der is not None
+
+        plus_offered = \
+            SCRAMAuthentication.SCRAM_SHA_256_PLUS in advertised
+        plain_offered = SCRAMAuthentication.SCRAM_SHA_256 in advertised
+
+        if policy == 'require' and not encrypted:
+            self.result_type = RESULT_FAILED
+            self.result = apg_exc.InterfaceError(
+                'SCRAM channel binding is required, but the connection '
+                'is not encrypted with SSL/TLS')
+            return None
+
+        if plus_offered and not encrypted:
+            self.result_type = RESULT_FAILED
+            self.result = apg_exc.InterfaceError(
+                'the server offered the SCRAM-SHA-256-PLUS SASL '
+                'mechanism over a connection that is not encrypted '
+                'with SSL/TLS; refusing to downgrade authentication')
+            return None
+
+        if plus_offered and encrypted and policy != 'disable':
+            channel_binding_data = \
+                _build_tls_server_end_point_binding(cert_der)
+            return (
+                SCRAMAuthentication.SCRAM_SHA_256_PLUS,
+                channel_binding_data,
+                False,
+            )
+
+        if plain_offered and policy != 'require':
+            # Over an encrypted connection with the "prefer" policy,
+            # advertise client-side channel binding support with the
+            # "y" GS2 flag, matching libpq.
+            supports_channel_binding = \
+                encrypted and policy == 'prefer'
+            return (
+                SCRAMAuthentication.SCRAM_SHA_256,
+                None,
+                supports_channel_binding,
+            )
+
+        if policy == 'require':
+            self.result_type = RESULT_FAILED
+            self.result = apg_exc.InterfaceError(
+                'SCRAM channel binding is required, but the server did '
+                'not offer an authentication mechanism that supports '
+                'channel binding; SASL mechanisms advertised by the '
+                'server: {!r}'.format(
+                    [m.decode("ascii", "replace") for m in advertised]))
+            return None
+
+        self.result_type = RESULT_FAILED
+        self.result = apg_exc.InterfaceError(
+            'unsupported SASL Authentication methods requested by the '
+            'server: {!r}'.format(
+                ", ".join(m.decode("ascii", "replace") for m in advertised)))
+        return None
+
+    cdef _auth_password_message_sasl_initial(
+            self, bytes sasl_auth_method, bytes channel_binding_data,
+            bint supports_channel_binding):
         cdef:
             WriteBuffer msg
 
-        # use the first supported advertized mechanism
-        self.scram = SCRAMAuthentication(sasl_auth_methods[0])
+        self.scram = SCRAMAuthentication(
+            sasl_auth_method, channel_binding_data,
+            supports_channel_binding)
         # this involves a call and response with the server
         msg = WriteBuffer.new_message(b'p')
         msg.write_bytes(self.scram.create_client_first_message(self.user or ''))

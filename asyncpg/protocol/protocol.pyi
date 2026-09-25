@@ -263,15 +263,26 @@ class Timer:
 
 @final
 class SCRAMAuthentication:
-    AUTHENTICATION_METHODS: ClassVar[list[str]]
+    AUTHENTICATION_METHODS: ClassVar[list[bytes]]
+    CHANNEL_BINDING_METHODS: ClassVar[dict[bytes, bytes]]
     DEFAULT_CLIENT_NONCE_BYTES: ClassVar[int]
     DIGEST = sha256
     REQUIREMENTS_CLIENT_FINAL_MESSAGE: ClassVar[list[str]]
     REQUIREMENTS_CLIENT_PROOF: ClassVar[list[str]]
     SASLPREP_PROHIBITED: ClassVar[tuple[Callable[[str], bool], ...]]
+    SCRAM_SHA_256: ClassVar[bytes]
+    SCRAM_SHA_256_PLUS: ClassVar[bytes]
+    TLS_SERVER_END_POINT: ClassVar[bytes]
+    def __init__(
+        self,
+        authentication_method: bytes,
+        channel_binding_data: bytes | None = ...,
+        supports_channel_binding: bool = ...,
+    ) -> None: ...
     authentication_method: bytes
     authorization_message: bytes | None
     client_channel_binding: bytes
+    gs2_header: bytes
     client_first_message_bare: bytes | None
     client_nonce: bytes | None
     client_proof: bytes | None
@@ -280,3 +291,7 @@ class SCRAMAuthentication:
     server_first_message: bytes | None
     server_key: hmac.HMAC | None
     server_nonce: bytes | None
+
+
+def _build_tls_server_end_point_binding(cert_der: bytes) -> bytes: ...
+def _read_x509_signature_algorithm_oid(cert_der: bytes) -> str: ...

@@ -10,6 +10,7 @@ cdef class SCRAMAuthentication:
         readonly bytes authentication_method
         readonly bytes authorization_message
         readonly bytes client_channel_binding
+        readonly bytes gs2_header
         readonly bytes client_first_message_bare
         readonly bytes client_nonce
         readonly bytes client_proof
@@ -20,10 +21,10 @@ cdef class SCRAMAuthentication:
         readonly object server_key
         readonly bytes server_nonce
 
-    cdef create_client_first_message(self, str username)
-    cdef create_client_final_message(self, str password)
-    cdef parse_server_first_message(self, bytes server_response)
-    cdef verify_server_final_message(self, bytes server_final_message)
+    cpdef create_client_first_message(self, str username)
+    cpdef create_client_final_message(self, str password)
+    cpdef parse_server_first_message(self, bytes server_response)
+    cpdef bint verify_server_final_message(self, bytes server_final_message)
     cdef _bytes_xor(self, bytes a, bytes b)
     cdef _generate_client_nonce(self, int num_bytes)
     cdef _generate_client_proof(self, str password)

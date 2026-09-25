@@ -986,6 +986,9 @@ cdef class BaseProtocol(CoreProtocol):
             self._on_error(ex)
 
     def connection_lost(self, exc):
+        # Drop any half-finished SASL/SCRAM exchange so that the
+        # connection object does not retain partial authentication state.
+        self.scram = None
         self.con_status = CONNECTION_BAD
         self._set_state(PROTOCOL_FAILED)
         self._on_connection_lost(exc)

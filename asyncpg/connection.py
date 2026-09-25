@@ -2099,7 +2099,8 @@ async def connect(dsn=None, *,
                   server_settings=None,
                   target_session_attrs=None,
                   krbsrvname=None,
-                  gsslib=None):
+                  gsslib=None,
+                  channel_binding=None):
     r"""A coroutine to establish a connection to a PostgreSQL server.
 
     The connection parameters may be specified either as a connection
@@ -2343,6 +2344,28 @@ async def connect(dsn=None, *,
         GSS library to use for GSSAPI/SSPI authentication. Can be 'gssapi'
         or 'sspi'. Defaults to 'sspi' on Windows and 'gssapi' otherwise.
 
+    :param str channel_binding:
+        Controls whether SCRAM authentication is bound to the encrypted
+        TLS channel (the ``SCRAM-SHA-256-PLUS`` mechanism with
+        ``tls-server-end-point`` channel binding).  Allowed values are:
+
+        - ``'disable'`` - never use channel binding (the default;
+          preserves the historical behavior).
+        - ``'prefer'`` - use channel binding when the connection is
+          encrypted with SSL/TLS and the server offers a channel-binding
+          mechanism; fall back to plain SCRAM authentication otherwise.
+        - ``'require'`` - only authenticate using a channel-binding
+          mechanism over an encrypted connection.  If the connection is
+          not encrypted, or the server does not offer a channel-binding
+          mechanism (including requesting MD5 or cleartext password
+          authentication), the connection fails before any password data
+          is sent.
+
+        Invalid values raise a :class:`~asyncpg.ClientConfigurationError`
+        before any network connection is attempted.  This option can only
+        be passed as a keyword argument; it is not read from the *dsn*
+        or the environment.
+
     :return: A :class:`~asyncpg.connection.Connection` instance.
 
     Example:
@@ -2417,6 +2440,11 @@ async def connect(dsn=None, *,
     .. versionchanged:: 0.31.0
        Added the *servicefile* and *service* parameters.
 
+    .. versionchanged:: 0.32.0
+       Added the *channel_binding* parameter to support SCRAM-SHA-256-PLUS
+       (``tls-server-end-point``) channel binding authentication over
+       encrypted connections.
+
     .. _SSLContext: https://docs.python.org/3/library/ssl.html#ssl.SSLContext
     .. _create_default_context:
         https://docs.python.org/3/library/ssl.html#ssl.create_default_context
@@ -2463,6 +2491,7 @@ async def connect(dsn=None, *,
             target_session_attrs=target_session_attrs,
             krbsrvname=krbsrvname,
             gsslib=gsslib,
+            channel_binding=channel_binding,
         )
 
 

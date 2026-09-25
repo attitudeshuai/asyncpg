@@ -53,6 +53,33 @@ class SSLNegotiation(compat.StrEnum):
     direct = "direct"
 
 
+class ChannelBinding(compat.StrEnum):
+    """SCRAM channel binding policy (``channel_binding`` parameter).
+
+    The policy determines whether the client uses a channel-binding-enabled
+    SASL mechanism (``SCRAM-SHA-256-PLUS`` with ``tls-server-end-point``)
+    when the server offers one.
+
+    - ``disable`` -- never use channel binding (the historical asyncpg
+      behavior and the default).
+    - ``prefer`` -- use channel binding when the connection is encrypted
+      and the server offers a channel-binding mechanism, otherwise fall
+      back to a plain mechanism.
+    - ``require`` -- only authenticate with a channel-binding mechanism
+      over an encrypted connection, otherwise fail before authentication.
+    """
+
+    disable = 'disable'
+    prefer = 'prefer'
+    require = 'require'
+
+    @classmethod
+    def parse(cls, channel_binding):
+        if isinstance(channel_binding, cls):
+            return channel_binding
+        return cls(channel_binding)
+
+
 _ConnectionParameters = collections.namedtuple(
     'ConnectionParameters',
     [
@@ -66,6 +93,7 @@ _ConnectionParameters = collections.namedtuple(
         'target_session_attrs',
         'krbsrvname',
         'gsslib',
+        'channel_binding',
     ])
 
 
@@ -277,7 +305,8 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
                                 password, passfile, database, ssl,
                                 service, servicefile,
                                 direct_tls, server_settings,
-                                target_session_attrs, krbsrvname, gsslib):
+                                target_session_attrs, krbsrvname, gsslib,
+                                channel_binding=None):
     # `auth_hosts` is the version of host information for the purposes
     # of reading the pgpass file.
     auth_hosts = None
@@ -849,12 +878,28 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
             "gsslib parameter must be either 'gssapi' or 'sspi'"
             ", got {!r}".format(gsslib))
 
+    # The channel binding policy is only configurable through the
+    # `channel_binding` keyword argument; it is intentionally not read
+    # from the DSN, service files or the environment.
+    if channel_binding is None:
+        channel_binding = ChannelBinding.disable
+    else:
+        try:
+            channel_binding = ChannelBinding.parse(channel_binding)
+        except (TypeError, ValueError):
+            raise exceptions.ClientConfigurationError(
+                '`channel_binding` parameter must be one of: {}'.format(
+                    ', '.join(m.value for m in ChannelBinding)
+                )
+            ) from None
+
     params = _ConnectionParameters(
         user=user, password=password, database=database, ssl=ssl,
         sslmode=sslmode, ssl_negotiation=sslneg,
         server_settings=server_settings,
         target_session_attrs=target_session_attrs,
-        krbsrvname=krbsrvname, gsslib=gsslib)
+        krbsrvname=krbsrvname, gsslib=gsslib,
+        channel_binding=channel_binding)
 
     return addrs, params
 
@@ -866,7 +911,7 @@ def _parse_connect_arguments(*, dsn, host, port, user, password, passfile,
                              max_cacheable_statement_size,
                              ssl, direct_tls, server_settings,
                              target_session_attrs, krbsrvname, gsslib,
-                             service, servicefile):
+                             service, servicefile, channel_binding=None):
     local_vars = locals()
     for var_name in {'max_cacheable_statement_size',
                      'max_cached_statement_lifetime',
@@ -897,7 +942,8 @@ def _parse_connect_arguments(*, dsn, host, port, user, password, passfile,
         server_settings=server_settings,
         target_session_attrs=target_session_attrs,
         krbsrvname=krbsrvname, gsslib=gsslib,
-        service=service, servicefile=servicefile)
+        service=service, servicefile=servicefile,
+        channel_binding=channel_binding)
 
     config = _ClientConfiguration(
         command_timeout=command_timeout,

@@ -846,6 +846,43 @@ class TestConnectParams(tb.TestCase):
             ),
         },
 
+        {
+            'name': 'channel_binding_prefer',
+            'dsn': 'postgresql://user@host/db',
+            'channel_binding': 'prefer',
+            'result': ([('host', 5432)], {
+                'database': 'db',
+                'user': 'user',
+                'target_session_attrs': 'any',
+                'channel_binding': 'prefer',
+            })
+        },
+
+        {
+            'name': 'channel_binding_invalid',
+            'dsn': 'postgresql://user@host/db',
+            'channel_binding': 'bogus',
+            'error': (
+                exceptions.ClientConfigurationError,
+                '`channel_binding` parameter must be one of: '
+                'disable, prefer, require'
+            ),
+        },
+
+        {
+            # The channel binding policy is not configurable via the
+            # connection URI; an unknown option is treated as a server
+            # setting and the policy stays at its default.
+            'name': 'channel_binding_dsn_not_recognized',
+            'dsn': 'postgresql://user@host/db?channel_binding=require',
+            'result': ([('host', 5432)], {
+                'database': 'db',
+                'user': 'user',
+                'target_session_attrs': 'any',
+                'server_settings': {'channel_binding': 'require'},
+            })
+        },
+
         # broken by https://github.com/python/cpython/pull/129418
         # {
         #     'name': 'dsn_ipv6_multi_host',
@@ -1149,6 +1186,7 @@ class TestConnectParams(tb.TestCase):
         target_session_attrs = testcase.get('target_session_attrs')
         krbsrvname = testcase.get('krbsrvname')
         gsslib = testcase.get('gsslib')
+        channel_binding = testcase.get('channel_binding')
         service = testcase.get('service')
         servicefile = testcase.get('servicefile')
 
@@ -1177,6 +1215,7 @@ class TestConnectParams(tb.TestCase):
                 server_settings=server_settings,
                 target_session_attrs=target_session_attrs,
                 krbsrvname=krbsrvname, gsslib=gsslib,
+                channel_binding=channel_binding,
                 service=service, servicefile=servicefile)
 
             params = {
@@ -1207,6 +1246,10 @@ class TestConnectParams(tb.TestCase):
                 # Avoid the hassle of specifying gsslib
                 # unless explicitly tested for
                 params.pop('gsslib', None)
+            if 'channel_binding' not in expected[1]:
+                # Avoid the hassle of specifying the default channel
+                # binding policy unless explicitly tested for
+                params.pop('channel_binding', None)
 
             self.assertEqual(expected, result, 'Testcase: {}'.format(testcase))
 
@@ -2101,6 +2144,118 @@ class TestSSLConnection(BaseTestSSLConnection):
                     await con.close()
             finally:
                 self.loop.set_exception_handler(old_handler)
+
+
+CB_PASSWORD = 'channel_binding_password'
+
+
+@unittest.skipIf(os.environ.get('PGHOST'), 'unmanaged cluster')
+class TestSCRAMChannelBindingSSL(BaseTestSSLConnection):
+    """SCRAM-SHA-256-PLUS against a real SSL-enabled cluster."""
+
+    def setUp(self):
+        if self.cluster.get_pg_version() < (11, 0):
+            self.skipTest('SCRAM-SHA-256-PLUS requires PostgreSQL 11+')
+        super().setUp()
+        create_script = (
+            "SET password_encryption = 'scram-sha-256';"
+            "CREATE ROLE cb_user WITH LOGIN PASSWORD E{!r};"
+            "SET password_encryption = 'md5';"
+        ).format(CB_PASSWORD)
+        self.loop.run_until_complete(self.con.execute(create_script))
+
+    def tearDown(self):
+        self.loop.run_until_complete(
+            self.con.execute('DROP ROLE IF EXISTS cb_user;'))
+        super().tearDown()
+
+    def _add_hba_entry(self):
+        # SSL and non-SSL SCRAM rules: the server advertises
+        # SCRAM-SHA-256-PLUS only on the hostssl matches.
+        for type_ in ('hostssl', 'host'):
+            for network in ('127.0.0.0/24', '::1/128'):
+                self.cluster.add_hba_entry(
+                    type=type_, address=ipaddress.ip_network(network),
+                    database='postgres', user='cb_user',
+                    auth_method='scram-sha-256')
+
+    async def test_cb_disable_over_ssl(self):
+        con = await self.connect(
+            host='localhost', user='cb_user', password=CB_PASSWORD,
+            ssl='require', channel_binding='disable')
+        try:
+            self.assertTrue(con._protocol.is_ssl)
+            self.assertEqual(await con.fetchval('SELECT 42'), 42)
+        finally:
+            await con.close()
+
+    async def test_cb_prefer_over_ssl(self):
+        con = await self.connect(
+            host='localhost', user='cb_user', password=CB_PASSWORD,
+            ssl='require', channel_binding='prefer')
+        try:
+            self.assertTrue(con._protocol.is_ssl)
+            self.assertEqual(await con.fetchval('SELECT 42'), 42)
+        finally:
+            await con.close()
+
+    async def test_cb_require_over_ssl(self):
+        con = await self.connect(
+            host='localhost', user='cb_user', password=CB_PASSWORD,
+            ssl='require', channel_binding='require')
+        try:
+            self.assertTrue(con._protocol.is_ssl)
+            self.assertEqual(await con.fetchval('SELECT 42'), 42)
+        finally:
+            await con.close()
+
+    async def test_cb_prefer_without_ssl_falls_back(self):
+        con = await self.connect(
+            host='localhost', user='cb_user', password=CB_PASSWORD,
+            ssl=False, channel_binding='prefer')
+        try:
+            self.assertFalse(con._protocol.is_ssl)
+            self.assertEqual(await con.fetchval('SELECT 42'), 42)
+        finally:
+            await con.close()
+
+    async def test_cb_require_without_ssl_fails(self):
+        message = (
+            'SCRAM channel binding is required, but the connection is '
+            'not encrypted')
+        with self.assertRaisesRegex(exceptions.InterfaceError, message):
+            await self.connect(
+                host='localhost', user='cb_user', password=CB_PASSWORD,
+                ssl=False, channel_binding='require')
+
+    async def test_cb_invalid_policy(self):
+        with self.assertRaises(exceptions.ClientConfigurationError):
+            await self.connect(
+                host='localhost', user='cb_user', password=CB_PASSWORD,
+                ssl='require', channel_binding='bogus')
+
+    async def test_cb_wrong_password_is_password_error(self):
+        with self.assertRaisesRegex(
+                asyncpg.InvalidPasswordError,
+                'password authentication failed for user "cb_user"'):
+            await self.connect(
+                host='localhost', user='cb_user', password='wrong',
+                ssl='require', channel_binding='prefer')
+
+    async def test_cb_pool(self):
+        pool = await self.create_pool(
+            host='localhost', user='cb_user', password=CB_PASSWORD,
+            database='postgres', ssl='require',
+            channel_binding='require', min_size=1, max_size=2)
+        try:
+            con = await pool.acquire()
+            try:
+                self.assertTrue(con._protocol.is_ssl)
+                self.assertEqual(await con.fetchval('SELECT 42'), 42)
+            finally:
+                await pool.release(con)
+        finally:
+            await pool.close()
 
 
 @unittest.skipIf(os.environ.get('PGHOST'), 'unmanaged cluster')

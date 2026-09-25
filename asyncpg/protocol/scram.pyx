@@ -14,6 +14,132 @@ import stringprep
 import unicodedata
 
 
+# Signature algorithm OIDs of X.509 certificates whose hash algorithm is
+# strong enough to be reused directly for the RFC 5929
+# "tls-server-end-point" channel binding.  This mirrors the table used by
+# PostgreSQL and libpq (OBJ_find_sigid_algs() in OpenSSL): only SHA-256,
+# SHA-384 and SHA-512 are selected, every other signature algorithm
+# (MD5, SHA-1, SHA-224, RSASSA-PSS, EdDSA, ...) falls back to SHA-256.
+_TLS_SERVER_END_POINT_HASH_BY_OID = {
+    # sha256WithRSAEncryption, sha384WithRSAEncryption,
+    # sha512WithRSAEncryption
+    '1.2.840.113549.1.1.11': 'sha256',
+    '1.2.840.113549.1.1.12': 'sha384',
+    '1.2.840.113549.1.1.13': 'sha512',
+    # ecdsa-with-SHA256/384/512
+    '1.2.840.10045.4.3.2': 'sha256',
+    '1.2.840.10045.4.3.3': 'sha384',
+    '1.2.840.10045.4.3.4': 'sha512',
+    # dsa-with-sha256/384/512
+    '2.16.840.1.101.3.4.3.2': 'sha256',
+    '2.16.840.1.101.3.4.3.3': 'sha384',
+    '2.16.840.1.101.3.4.3.4': 'sha512',
+}
+
+
+def _read_der_element_length(bytes data, int offset):
+    """Read a DER length at *offset*, return (length, next_offset)."""
+    cdef:
+        int first
+        int num
+        int length
+
+    first = data[offset]
+    if first & 0x80:
+        num = first & 0x7f
+        if num == 0 or num > 4:
+            raise ValueError('invalid DER length in X.509 certificate')
+        length = 0
+        for i in range(num):
+            length = (length << 8) | data[offset + 1 + i]
+        return length, offset + 1 + num
+    return first, offset + 1
+
+
+def _decode_der_oid(bytes oid_bytes):
+    """Decode DER OID content octets into dotted-decimal text."""
+    cdef:
+        list parts
+        object value
+        int byte
+
+    if not oid_bytes:
+        raise ValueError('empty OID in X.509 certificate')
+
+    parts = [str(oid_bytes[0] // 40), str(oid_bytes[0] % 40)]
+    value = 0
+    for byte in oid_bytes[1:]:
+        value = (value << 7) | (byte & 0x7f)
+        if not byte & 0x80:
+            parts.append(str(value))
+            value = 0
+    return '.'.join(parts)
+
+
+def _read_x509_signature_algorithm_oid(bytes cert_der):
+    """Return the signatureAlgorithm OID (dotted text) of a DER X.509 cert.
+
+    The certificate has the following structure (RFC 5280)::
+
+        Certificate ::= SEQUENCE {
+            tbsCertificate      TBSCertificate,
+            signatureAlgorithm  AlgorithmIdentifier,
+            signatureValue      BIT STRING }
+
+    Only a minimal traversal is needed: skip the outer SEQUENCE and the
+    tbsCertificate SEQUENCE, then read the OID of the following
+    AlgorithmIdentifier.
+    """
+    cdef:
+        int pos
+        int tbs_len
+        int sig_algo_start
+        int oid_len
+        int oid_pos
+
+    if not cert_der or cert_der[0] != 0x30:
+        raise ValueError(
+            'invalid X.509 certificate: expected an outer DER SEQUENCE')
+
+    _, pos = _read_der_element_length(cert_der, 1)
+
+    if cert_der[pos] != 0x30:
+        raise ValueError(
+            'invalid X.509 certificate: missing tbsCertificate SEQUENCE')
+    tbs_len, pos = _read_der_element_length(cert_der, pos + 1)
+    pos += tbs_len
+
+    if cert_der[pos] != 0x30:
+        raise ValueError(
+            'invalid X.509 certificate: missing signatureAlgorithm')
+    _, sig_algo_start = _read_der_element_length(cert_der, pos + 1)
+
+    # The first member of AlgorithmIdentifier is the algorithm OID.
+    if cert_der[sig_algo_start] != 0x06:
+        raise ValueError(
+            'invalid X.509 certificate: signatureAlgorithm is not an OID')
+    oid_len, oid_pos = _read_der_element_length(
+        cert_der, sig_algo_start + 1)
+    return _decode_der_oid(cert_der[oid_pos:oid_pos + oid_len])
+
+
+def _build_tls_server_end_point_binding(bytes cert_der):
+    """Build the RFC 5929 tls-server-end-point channel binding data.
+
+    The DER-encoded server certificate is hashed with the digest used by
+    the certificate's own signature algorithm, except that weak (MD5,
+    SHA-1) or otherwise unsupported digests are replaced by SHA-256,
+    matching PostgreSQL and libpq.
+    """
+    cdef:
+        str sig_oid
+        str hash_name
+
+    sig_oid = _read_x509_signature_algorithm_oid(cert_der)
+    hash_name = _TLS_SERVER_END_POINT_HASH_BY_OID.get(sig_oid, 'sha256')
+    return hashlib.new(hash_name, cert_der).digest()
+
+
 @cython.final
 cdef class SCRAMAuthentication:
     """Contains the protocol for generating and a SCRAM hashed password.
@@ -41,7 +167,7 @@ cdef class SCRAMAuthentication:
 
     - The client sends a "first message" to the server, where it chooses which
     method to authenticate with, and sends, along with the method, an indication
-    of channel binding (we disable for now), a nonce, and the username.
+    of channel binding (the GS2 header), a nonce, and the username.
     (Technically, PostgreSQL ignores the username as it already has it from the
     initical connection, but we add it for completeness)
 
@@ -64,13 +190,22 @@ cdef class SCRAMAuthentication:
     (The beauty of this is that the salted password is never transmitted over
     the wire!)
 
-    PostgreSQL 11 added support for the channel binding (i.e.
-    SCRAM-SHA-256-PLUS) but to do some ongoing discussion, there is a conscious
-    decision by several driver authors to not support it as of yet. As such, the
-    channel binding parameter is hard-coded to "n" for now, but can be updated
-    to support other channel binding methos in the future
+    PostgreSQL 11 added support for channel binding (i.e.
+    SCRAM-SHA-256-PLUS).  When that mechanism is selected over an encrypted
+    connection, the GS2 header is "p=tls-server-end-point,," and the
+    channel-binding field of the final message carries the RFC 5929
+    "tls-server-end-point" data, i.e. a hash of the DER-encoded server
+    certificate.  On an encrypted connection that ended up using the plain
+    SCRAM-SHA-256 mechanism, the GS2 flag is "y" (the client supports
+    channel binding but believes the server does not); otherwise the flag
+    is "n".
     """
-    AUTHENTICATION_METHODS = [b"SCRAM-SHA-256"]
+    SCRAM_SHA_256 = b"SCRAM-SHA-256"
+    SCRAM_SHA_256_PLUS = b"SCRAM-SHA-256-PLUS"
+    TLS_SERVER_END_POINT = b"tls-server-end-point"
+    AUTHENTICATION_METHODS = [SCRAM_SHA_256]
+    # mechanism name -> channel binding type name (RFC 5929)
+    CHANNEL_BINDING_METHODS = {SCRAM_SHA_256_PLUS: TLS_SERVER_END_POINT}
     DEFAULT_CLIENT_NONCE_BYTES = 24
     DIGEST = hashlib.sha256
     REQUIREMENTS_CLIENT_FINAL_MESSAGE = ['client_channel_binding',
@@ -90,11 +225,11 @@ cdef class SCRAMAuthentication:
         stringprep.in_table_c9,
     )
 
-    def __cinit__(self, bytes authentication_method):
+    def __cinit__(self, bytes authentication_method,
+                  bytes channel_binding_data=None,
+                  bint supports_channel_binding=False):
         self.authentication_method = authentication_method
         self.authorization_message = None
-        # channel binding is turned off for the time being
-        self.client_channel_binding = b"n,,"
         self.client_first_message_bare = None
         self.client_nonce = None
         self.client_proof = None
@@ -104,7 +239,32 @@ cdef class SCRAMAuthentication:
         self.server_key = None
         self.server_nonce = None
 
-    cdef create_client_first_message(self, str username):
+        # Build the GS2 header and the channel binding data used in the
+        # "c=" attribute of the final message, following the rules in
+        # RFC 5802 section 6 and the tls-server-end-point definition in
+        # RFC 5929.
+        channel_binding_type = self.CHANNEL_BINDING_METHODS.get(
+            authentication_method)
+        if channel_binding_type is not None:
+            if not channel_binding_data:
+                raise ValueError(
+                    "channel binding data is required for the "
+                    "{!r} authentication mechanism".format(
+                        authentication_method))
+            self.gs2_header = b"p=" + channel_binding_type + b",,"
+            # cbind-input = gs2-header immediately followed by the
+            # channel binding data (same layout as in libpq).
+            self.client_channel_binding = \
+                self.gs2_header + channel_binding_data
+        else:
+            # "y" means that this client supports channel binding, but
+            # believes that the server does not (the negotiated
+            # mechanism is not a -PLUS one even though the connection
+            # is encrypted).
+            self.gs2_header = b"y,," if supports_channel_binding else b"n,,"
+            self.client_channel_binding = self.gs2_header
+
+    cpdef create_client_first_message(self, str username):
         """Create the initial client message for SCRAM authentication"""
         cdef:
             bytes msg
@@ -118,13 +278,13 @@ cdef class SCRAMAuthentication:
         # put together the full message here
         msg = bytes()
         msg += self.authentication_method + b"\0"
-        client_first_message = self.client_channel_binding + \
+        client_first_message = self.gs2_header + \
             self.client_first_message_bare
         msg += (len(client_first_message)).to_bytes(4, byteorder='big') + \
             client_first_message
         return msg
 
-    cdef create_client_final_message(self, str password):
+    cpdef create_client_final_message(self, str password):
         """Create the final client message as part of SCRAM authentication"""
         cdef:
             bytes msg
@@ -145,7 +305,7 @@ cdef class SCRAMAuthentication:
             b",p=" + base64.b64encode(self.client_proof)
         return msg
 
-    cdef parse_server_first_message(self, bytes server_response):
+    cpdef parse_server_first_message(self, bytes server_response):
         """Parse the response from the first message from the server"""
         self.server_first_message = server_response
         try:
@@ -166,7 +326,7 @@ cdef class SCRAMAuthentication:
         except (IndexError, TypeError, ValueError):
             raise Exception("could not get iterations")
 
-    cdef verify_server_final_message(self, bytes server_final_message):
+    cpdef bint verify_server_final_message(self, bytes server_final_message):
         """Verify the final message from the server"""
         cdef:
             bytes server_signature
@@ -214,9 +374,8 @@ cdef class SCRAMAuthentication:
         # as well as compute the server key
         self.server_key = hmac.new(salted_password, b"Server Key", self.DIGEST)
         # build the authorization message that will be used in the
-        # client signature
-        # the "c=" portion is for the channel binding, but this is not
-        # presently implemented
+        # client signature; the channel binding value in the "c="
+        # attribute is the same one sent in the client final message
         self.authorization_message = self.client_first_message_bare + b"," + \
             self.server_first_message + b",c=" + \
             base64.b64encode(self.client_channel_binding) + \
